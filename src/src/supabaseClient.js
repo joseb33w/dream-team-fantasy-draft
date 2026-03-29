@@ -8,5 +8,6 @@ export const TABLES = {
   members: 'uNMexs7BYTXQ2_dream_team_fantasy_draft_room_members',
   players: 'uNMexs7BYTXQ2_dream_team_fantasy_draft_players_pool',
   picks: 'uNMexs7BYTXQ2_dream_team_fantasy_draft_draft_picks',
-  matchups: 'uNMexs7BYTXQ2_dream_team_fantasy_draft_matchups'
+  matchups: 'uNMexs7BYTXQ2_dream_team_fantasy_draft_matchups',
+  botMatches: 'uNMexs7BYTXQ2_dream_team_fantasy_draft_bot_matches'
 }
