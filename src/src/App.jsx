@@ -1,605 +1,799 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { supabase, TABLES } from './supabaseClient';
-import { searchPlayers, loadFeaturedPlayers } from './nbaApi';
+import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { supabase, TABLES } from './supabaseClient'
+import { searchPlayers, loadFeaturedPlayers } from './nbaApi'
 
-/* ========== tiny helpers ========== */
-const wait = ms => new Promise(r => setTimeout(r, ms));
-const randId = () => Math.random().toString(36).slice(2, 10);
-const fantasyPts = () => Math.floor(Math.random() * 30 + 10);
+/* ───── tiny helpers ───── */
+const gen = (n = 8) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map(b => b.toString(36).padStart(2, '0')).join('').slice(0, n)
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const POSITIONS = ['PG', 'SG', 'SF', 'PF', 'C']
+const PICK_TIME = 30
+const MAX_ROSTER = 8
 
-/* ========== Three-style hero (pure CSS orb) ========== */
+/* ───── Toast system ───── */
+function ToastContainer({ toasts }) {
+  return (
+    <div style={{ position: 'fixed', top: 20, right: 20, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast-${t.type}`}>{t.msg}</div>
+      ))}
+    </div>
+  )
+}
+
+/* ───── Three-style court hero (CSS only) ───── */
 function ThreeCourtHero() {
   return (
-    <div className="hero-3d">
-      <div className="court-orb">
-        <div className="orb-ring ring1"></div>
-        <div className="orb-ring ring2"></div>
-        <div className="orb-ring ring3"></div>
-        <div className="orb-core">ð</div>
-      </div>
+    <div style={{ position: 'relative', width: '100%', height: 200, overflow: 'hidden', borderRadius: 16, marginBottom: 24, background: 'radial-gradient(ellipse at center, #1e3a5f 0%, #0a0a1a 100%)' }}>
+      <div style={{ position: 'absolute', top: '50%', left: '50%', width: 100, height: 100, borderRadius: '50%', transform: 'translate(-50%, -50%)', background: 'radial-gradient(circle, rgba(0,212,255,0.4) 0%, transparent 70%)', animation: 'pulse 2s ease-in-out infinite' }} />
+      <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', fontSize: 48 }}>🏀</div>
+      <div style={{ position: 'absolute', bottom: 16, width: '100%', textAlign: 'center', fontFamily: 'Orbitron', fontSize: 14, color: 'rgba(255,255,255,0.5)', letterSpacing: 4 }}>DREAM TEAM</div>
     </div>
-  );
+  )
 }
 
-/* ========== Toast ========== */
-function Toast({ msg, type, onDone }) {
-  useEffect(() => { const t = setTimeout(onDone, 2400); return () => clearTimeout(t); }, []);
-  return <div className={`toast toast-${type}`}>{msg}</div>;
-}
-
-/* ========== Main App ========== */
+/* ═══════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════ */
 export default function App() {
-  /* --- auth --- */
-  const [user, setUser] = useState(null);
-  const [profile, setProfile] = useState(null);
-  const [authMode, setAuthMode] = useState('login');
-  const [email, setEmail] = useState('');
-  const [pw, setPw] = useState('');
-  const [authErr, setAuthErr] = useState('');
-  const [authLoading, setAuthLoading] = useState(false);
+  // Auth
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authView, setAuthView] = useState('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [authError, setAuthError] = useState('')
 
-  /* --- nav --- */
-  const [view, setView] = useState('dash');        // dash | draft | profile | leaderboard | bot
-  const [toast, setToast] = useState(null);
+  // Navigation & global
+  const [view, setView] = useState('dashboard')
+  const [toasts, setToasts] = useState([])
 
-  /* --- rooms --- */
-  const [rooms, setRooms] = useState([]);
-  const [currentRoom, setCurrentRoom] = useState(null);
-  const [members, setMembers] = useState([]);
+  // Rooms
+  const [rooms, setRooms] = useState([])
+  const [currentRoom, setCurrentRoom] = useState(null)
+  const [roomMembers, setRoomMembers] = useState([])
+  const [joinCode, setJoinCode] = useState('')
+  const [newRoomName, setNewRoomName] = useState('')
+  const [newRoomSlots, setNewRoomSlots] = useState(4)
 
-  /* --- draft --- */
-  const [draftOrder, setDraftOrder] = useState([]);
-  const [currentPick, setCurrentPick] = useState(0);
-  const [picks, setPicks] = useState([]);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [searchResults, setSearchResults] = useState([]);
-  const [featured, setFeatured] = useState([]);
-  const [searching, setSearching] = useState(false);
-  const [draftStarted, setDraftStarted] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(0);
-  const timerRef = useRef(null);
+  // Draft
+  const [draftState, setDraftState] = useState('waiting') // waiting | active | complete
+  const [draftOrder, setDraftOrder] = useState([])
+  const [currentPickIdx, setCurrentPickIdx] = useState(0)
+  const [picks, setPicks] = useState([])
+  const [timer, setTimer] = useState(PICK_TIME)
+  const [availablePlayers, setAvailablePlayers] = useState([])
+  const [playerSearch, setPlayerSearch] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [searching, setSearching] = useState(false)
+  const [myRoster, setMyRoster] = useState([])
+  const [matchups, setMatchups] = useState([])
+  const timerRef = useRef(null)
 
-  /* --- leaderboard --- */
-  const [leaderboard, setLeaderboard] = useState([]);
+  // Profile & leaderboard
+  const [profile, setProfile] = useState(null)
+  const [leaderboard, setLeaderboard] = useState([])
+  const [profileLoading, setProfileLoading] = useState(false)
 
-  /* --- bot arena --- */
-  const [botDrafting, setBotDrafting] = useState(false);
-  const [botResults, setBotResults] = useState(null);
+  // Bot Arena
+  const [botDraft, setBotDraft] = useState(null)
+  const [botPlayers, setBotPlayers] = useState([])
+  const [botMyRoster, setBotMyRoster] = useState([])
+  const [botCpuRoster, setBotCpuRoster] = useState([])
+  const [botPickIdx, setBotPickIdx] = useState(0)
+  const [botTimer, setBotTimer] = useState(PICK_TIME)
+  const [botState, setBotState] = useState('idle') // idle | drafting | complete
+  const [botSearch, setBotSearch] = useState('')
+  const [botSearchResults, setBotSearchResults] = useState([])
+  const [botSearching, setBotSearching] = useState(false)
+  const botTimerRef = useRef(null)
+  const [featuredPlayers, setFeaturedPlayers] = useState([])
+  const [featuredLoading, setFeaturedLoading] = useState(false)
 
-  /* --- profile --- */
-  const [displayName, setDisplayName] = useState('');
-  const [avatar, setAvatar] = useState('ð');
-  const avatarChoices = ['ð', 'ð¥', 'â¡', 'ð', 'ð¯', 'ð', 'ð', 'ð¡ï¸'];
+  const toast = useCallback((msg, type = 'info') => {
+    const id = Date.now()
+    setToasts(prev => [...prev, { id, msg, type }])
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000)
+  }, [])
 
-  /* ===================== AUTH ===================== */
+  /* ── Auth ── */
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      if (data.user) { setUser(data.user); loadProfile(data.user.id); }
-    });
-    const { data: listener } = supabase.auth.onAuthStateChange((_, s) => {
-      if (s?.user) { setUser(s.user); loadProfile(s.user.id); }
-      else { setUser(null); setProfile(null); }
-    });
-    return () => listener.subscription.unsubscribe();
-  }, []);
-
-  async function loadProfile(uid) {
-    const { data } = await supabase.from(TABLES.users).select('*').eq('user_id', uid).maybeSingle();
-    if (data) { setProfile(data); setDisplayName(data.display_name || ''); setAvatar(data.avatar || 'ð'); }
-  }
+    supabase.auth.getUser().then(({ data: { user: u } }) => {
+      setUser(u)
+      setAuthLoading(false)
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => {
+      setUser(session?.user ?? null)
+    })
+    return () => subscription.unsubscribe()
+  }, [])
 
   async function handleAuth() {
-    setAuthErr(''); setAuthLoading(true);
-    try {
-      if (authMode === 'signup') {
-        const { error } = await supabase.auth.signUp({
-          email, password: pw,
-          options: { emailRedirectTo: 'https://sling-gogiapp.web.app/email-confirmed.html' }
-        });
-        if (error) throw error;
-        notify('Check your email to confirm!', 'success');
-      } else {
-        const { error } = await supabase.auth.signInWithPassword({ email, password: pw });
-        if (error) throw error;
+    setAuthError('')
+    if (authView === 'login') {
+      const { error } = await supabase.auth.signInWithPassword({ email, password })
+      if (error) setAuthError(error.message)
+      else toast('Welcome back! 🏀', 'success')
+    } else {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { emailRedirectTo: 'https://sling-gogiapp.web.app/email-confirmed.html' }
+      })
+      if (error) setAuthError(error.message)
+      else {
+        // Save display name
+        if (data.user) {
+          await supabase.from(TABLES.users).upsert({ user_id: data.user.id, email, display_name: displayName || email.split('@')[0] })
+        }
+        toast('Account created! Check email to confirm.', 'success')
       }
-    } catch (e) { setAuthErr(e.message); }
-    setAuthLoading(false);
+    }
   }
 
   async function logout() {
-    await supabase.auth.signOut();
-    setView('dash'); setCurrentRoom(null);
+    await supabase.auth.signOut()
+    setUser(null)
+    setView('dashboard')
+    setCurrentRoom(null)
+    toast('Signed out', 'info')
   }
 
-  /* ===================== PROFILE ===================== */
-  async function saveProfile() {
-    if (!user) return;
-    const row = { user_id: user.id, display_name: displayName, avatar };
-    if (profile) {
-      await supabase.from(TABLES.users).update(row).eq('id', profile.id);
-    } else {
-      await supabase.from(TABLES.users).insert(row);
-    }
-    await loadProfile(user.id);
-    notify('Profile saved!', 'success');
-    setView('dash');
+  /* ── Load rooms ── */
+  async function loadRooms() {
+    if (!user) return
+    const { data: memberRows } = await supabase.from(TABLES.members).select('room_id').eq('user_id', user.id)
+    if (!memberRows || memberRows.length === 0) { setRooms([]); return }
+    const roomIds = memberRows.map(r => r.room_id)
+    const { data: roomRows } = await supabase.from(TABLES.rooms).select('*').in('id', roomIds).order('created_at', { ascending: false })
+    setRooms(roomRows || [])
   }
 
-  /* ===================== ROOMS ===================== */
-  useEffect(() => { if (user) fetchRooms(); }, [user]);
+  useEffect(() => { if (user) loadRooms() }, [user])
 
-  async function fetchRooms() {
-    const { data } = await supabase.from(TABLES.rooms).select('*').order('created_at', { ascending: false }).limit(20);
-    setRooms(data || []);
-  }
-
+  /* ── Create room ── */
   async function createRoom() {
-    if (!user) return;
-    const code = randId().toUpperCase().slice(0, 6);
-    const { data, error } = await supabase.from(TABLES.rooms).insert({
-      user_id: user.id, code, name: `${profile?.display_name || 'Player'}'s Room`,
-      max_players: 4, status: 'waiting'
-    }).select().single();
-    if (error) { notify(error.message, 'error'); return; }
-    await joinRoom(data);
-    notify(`Room ${code} created!`, 'success');
+    if (!newRoomName.trim()) return toast('Enter a room name', 'error')
+    const code = gen(6).toUpperCase()
+    const { data: room, error } = await supabase.from(TABLES.rooms).insert({
+      user_id: user.id,
+      name: newRoomName.trim(),
+      code,
+      max_slots: newRoomSlots,
+      status: 'waiting'
+    }).select().single()
+    if (error) return toast('Failed to create room', 'error')
+    await supabase.from(TABLES.members).insert({ user_id: user.id, room_id: room.id, display_name: displayName || email.split('@')[0] })
+    toast(`Room created! Code: ${code}`, 'success')
+    setNewRoomName('')
+    loadRooms()
   }
 
-  async function joinRoom(room) {
-    if (!user) return;
-    const existing = await supabase.from(TABLES.members).select('id').eq('room_id', room.id).eq('user_id', user.id).maybeSingle();
-    if (!existing.data) {
-      await supabase.from(TABLES.members).insert({ user_id: user.id, room_id: room.id, display_name: profile?.display_name || 'Player', avatar: avatar });
+  /* ── Join room ── */
+  async function joinRoom() {
+    if (!joinCode.trim()) return toast('Enter a room code', 'error')
+    const { data: room } = await supabase.from(TABLES.rooms).select('*').eq('code', joinCode.trim().toUpperCase()).single()
+    if (!room) return toast('Room not found', 'error')
+    const { data: existing } = await supabase.from(TABLES.members).select('id').eq('room_id', room.id).eq('user_id', user.id).single()
+    if (!existing) {
+      const { data: allMembers } = await supabase.from(TABLES.members).select('id').eq('room_id', room.id)
+      if (allMembers && allMembers.length >= room.max_slots) return toast('Room is full', 'error')
+      await supabase.from(TABLES.members).insert({ user_id: user.id, room_id: room.id, display_name: displayName || email.split('@')[0] })
     }
-    setCurrentRoom(room);
-    await loadMembers(room.id);
-    setView('draft');
-    await loadDraft(room.id);
+    toast(`Joined ${room.name}!`, 'success')
+    setJoinCode('')
+    loadRooms()
   }
 
-  async function joinByCode(code) {
-    const { data } = await supabase.from(TABLES.rooms).select('*').eq('code', code.toUpperCase()).maybeSingle();
-    if (data) joinRoom(data);
-    else notify('Room not found', 'error');
-  }
-
-  async function loadMembers(roomId) {
-    const { data } = await supabase.from(TABLES.members).select('*').eq('room_id', roomId);
-    setMembers(data || []);
-    return data || [];
-  }
-
-  /* ===================== DRAFT ===================== */
-  useEffect(() => { loadFeaturedPlayers().then(f => setFeatured(f)); }, []);
-
-  async function loadDraft(roomId) {
-    const { data: p } = await supabase.from(TABLES.picks).select('*').eq('room_id', roomId).order('pick_number');
-    setPicks(p || []);
-    if (p && p.length) {
-      setCurrentPick(p.length);
-      setDraftStarted(true);
+  /* ── Enter room ── */
+  async function enterRoom(room) {
+    setCurrentRoom(room)
+    setView('room')
+    const { data: members } = await supabase.from(TABLES.members).select('*').eq('room_id', room.id)
+    setRoomMembers(members || [])
+    const { data: pickRows } = await supabase.from(TABLES.picks).select('*').eq('room_id', room.id).order('pick_number')
+    setPicks(pickRows || [])
+    if (room.status === 'drafting') {
+      setDraftState('active')
+      rebuildDraftOrder(members || [], room)
+      setCurrentPickIdx(pickRows ? pickRows.length : 0)
+      startDraftTimer()
+      await loadAvailablePlayers(pickRows || [])
+    } else if (room.status === 'complete') {
+      setDraftState('complete')
+      loadMatchups(room.id)
+    } else {
+      setDraftState('waiting')
     }
+    buildMyRoster(pickRows || [])
   }
 
-  function buildSnakeOrder(membersList, rounds = 3) {
-    const order = [];
-    for (let r = 0; r < rounds; r++) {
-      const arr = membersList.map(m => m.id);
-      if (r % 2 === 1) arr.reverse();
-      order.push(...arr);
+  function rebuildDraftOrder(members, room) {
+    const mIds = members.map(m => m.user_id)
+    const totalPicks = MAX_ROSTER * mIds.length
+    const order = []
+    for (let round = 0; round < MAX_ROSTER; round++) {
+      const arr = round % 2 === 0 ? [...mIds] : [...mIds].reverse()
+      order.push(...arr)
     }
-    return order;
+    setDraftOrder(order.slice(0, totalPicks))
   }
 
+  function buildMyRoster(pickRows) {
+    if (!user) return
+    setMyRoster(pickRows.filter(p => p.user_id === user.id))
+  }
+
+  /* ── Start draft ── */
   async function startDraft() {
-    if (!currentRoom) return;
-    const mems = await loadMembers(currentRoom.id);
-    if (mems.length < 2) { notify('Need at least 2 players', 'error'); return; }
-    const order = buildSnakeOrder(mems);
-    setDraftOrder(order);
-    setCurrentPick(0);
-    setPicks([]);
-    setDraftStarted(true);
-    await supabase.from(TABLES.rooms).update({ status: 'drafting' }).eq('id', currentRoom.id);
-    startTimer();
-    notify('Draft started! ð¥', 'success');
+    if (!currentRoom) return
+    await supabase.from(TABLES.rooms).update({ status: 'drafting' }).eq('id', currentRoom.id)
+    setCurrentRoom({ ...currentRoom, status: 'drafting' })
+    setDraftState('active')
+    rebuildDraftOrder(roomMembers, currentRoom)
+    setCurrentPickIdx(0)
+    setPicks([])
+    setMyRoster([])
+    startDraftTimer()
+    await loadAvailablePlayers([])
+    toast('Draft started! 🎉', 'success')
   }
 
-  function startTimer() {
-    setTimeLeft(30);
-    clearInterval(timerRef.current);
+  async function loadAvailablePlayers(existingPicks) {
+    const featured = await loadFeaturedPlayers()
+    const pickedIds = new Set(existingPicks.map(p => p.player_id))
+    setAvailablePlayers(featured.filter(p => !pickedIds.has(p.id)))
+  }
+
+  function startDraftTimer() {
+    setTimer(PICK_TIME)
+    clearInterval(timerRef.current)
     timerRef.current = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1) { clearInterval(timerRef.current); autoPick(); return 0; }
-        return prev - 1;
-      });
-    }, 1000);
+      setTimer(prev => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current)
+          autoPick()
+          return PICK_TIME
+        }
+        return prev - 1
+      })
+    }, 1000)
   }
 
   async function autoPick() {
-    if (featured.length) {
-      const available = featured.filter(f => !picks.some(p => p.player_id === f.id));
-      if (available.length) { await draftPlayer(available[0]); return; }
+    if (availablePlayers.length > 0) {
+      const randomPlayer = availablePlayers[Math.floor(Math.random() * availablePlayers.length)]
+      await makePick(randomPlayer)
     }
-    notify('No player available for auto-pick', 'error');
   }
 
-  async function draftPlayer(player) {
-    if (!currentRoom || !draftStarted) return;
-    const alreadyPicked = picks.some(p => p.player_id === player.id);
-    if (alreadyPicked) { notify('Already drafted!', 'error'); return; }
+  async function makePick(player) {
+    if (!currentRoom || !user) return
+    if (draftOrder[currentPickIdx] !== user.id) return toast('Not your turn!', 'error')
+    const pick = {
+      room_id: currentRoom.id,
+      user_id: user.id,
+      player_id: player.id,
+      player_name: player.name,
+      player_team: player.team,
+      player_position: player.position,
+      player_thumb: player.thumb || '',
+      fantasy_pts: player.fantasyPts || 0,
+      pick_number: currentPickIdx + 1
+    }
+    const { error } = await supabase.from(TABLES.picks).insert(pick)
+    if (error) return toast('Failed to pick', 'error')
+    const newPicks = [...picks, pick]
+    setPicks(newPicks)
+    buildMyRoster(newPicks)
+    setAvailablePlayers(prev => prev.filter(p => p.id !== player.id))
+    toast(`Drafted ${player.name}! 🔥`, 'success')
 
-    const memberId = draftOrder[currentPick];
-    const member = members.find(m => m.id === memberId);
-    const pts = fantasyPts();
-
-    const pickRow = {
-      user_id: user.id, room_id: currentRoom.id, member_id: memberId,
-      player_id: player.id, player_name: player.name, player_team: player.team,
-      player_pos: player.pos, player_thumb: player.thumb,
-      pick_number: currentPick, fantasy_pts: pts
-    };
-
-    const { error } = await supabase.from(TABLES.picks).insert(pickRow);
-    if (error) { notify(error.message, 'error'); return; }
-
-    const newPicks = [...picks, pickRow];
-    setPicks(newPicks);
-
-    notify(`${member?.display_name || 'Player'} drafted ${player.name}! (${pts} pts)`, 'success');
-
-    const next = currentPick + 1;
-    if (next >= draftOrder.length) {
-      clearInterval(timerRef.current);
-      setDraftStarted(false);
-      await supabase.from(TABLES.rooms).update({ status: 'complete' }).eq('id', currentRoom.id);
-      notify('Draft complete! ð', 'success');
-      generateMatchups(newPicks);
+    const nextIdx = currentPickIdx + 1
+    if (nextIdx >= draftOrder.length) {
+      completeDraft()
     } else {
-      setCurrentPick(next);
-      startTimer();
+      setCurrentPickIdx(nextIdx)
+      clearInterval(timerRef.current)
+      startDraftTimer()
     }
   }
 
-  /* ===================== MATCHUPS ===================== */
-  async function generateMatchups(allPicks) {
-    if (!currentRoom || members.length < 2) return;
-    const matchups = [];
-    for (let i = 0; i < members.length; i++) {
-      for (let j = i + 1; j < members.length; j++) {
-        const m1 = members[i], m2 = members[j];
-        const pts1 = allPicks.filter(p => p.member_id === m1.id).reduce((s, p) => s + (p.fantasy_pts || 0), 0);
-        const pts2 = allPicks.filter(p => p.member_id === m2.id).reduce((s, p) => s + (p.fantasy_pts || 0), 0);
-        matchups.push({
-          user_id: user.id, room_id: currentRoom.id,
-          member1_id: m1.id, member2_id: m2.id,
-          member1_name: m1.display_name, member2_name: m2.display_name,
-          member1_pts: pts1, member2_pts: pts2,
-          winner_id: pts1 > pts2 ? m1.id : pts2 > pts1 ? m2.id : null
-        });
+  async function completeDraft() {
+    clearInterval(timerRef.current)
+    setDraftState('complete')
+    await supabase.from(TABLES.rooms).update({ status: 'complete' }).eq('id', currentRoom.id)
+    setCurrentRoom({ ...currentRoom, status: 'complete' })
+    await generateMatchups()
+    toast('Draft complete! Matchups generated! 🏆', 'success')
+  }
+
+  async function generateMatchups() {
+    const memberIds = roomMembers.map(m => m.user_id)
+    const newMatchups = []
+    for (let i = 0; i < memberIds.length; i++) {
+      for (let j = i + 1; j < memberIds.length; j++) {
+        newMatchups.push({
+          room_id: currentRoom.id,
+          user_a: memberIds[i],
+          user_b: memberIds[j],
+          score_a: Math.floor(Math.random() * 150) + 80,
+          score_b: Math.floor(Math.random() * 150) + 80,
+        })
       }
     }
-    await supabase.from(TABLES.matchups).insert(matchups);
+    if (newMatchups.length > 0) {
+      await supabase.from(TABLES.matchups).insert(newMatchups)
+    }
+    setMatchups(newMatchups)
   }
 
-  /* ===================== LEADERBOARD ===================== */
+  async function loadMatchups(roomId) {
+    const { data } = await supabase.from(TABLES.matchups).select('*').eq('room_id', roomId)
+    setMatchups(data || [])
+  }
+
+  /* ── Player search ── */
+  useEffect(() => {
+    if (!playerSearch || playerSearch.length < 2) { setSearchResults([]); return }
+    setSearching(true)
+    const timeout = setTimeout(async () => {
+      const results = await searchPlayers(playerSearch)
+      const pickedIds = new Set(picks.map(p => p.player_id))
+      setSearchResults(results.filter(p => !pickedIds.has(p.id)))
+      setSearching(false)
+    }, 400)
+    return () => clearTimeout(timeout)
+  }, [playerSearch, picks])
+
+  /* ── Profile ── */
+  async function loadProfile() {
+    setProfileLoading(true)
+    const { data } = await supabase.from(TABLES.users).select('*').eq('user_id', user.id).single()
+    setProfile(data)
+    setProfileLoading(false)
+  }
+
   async function loadLeaderboard() {
-    const { data } = await supabase.from(TABLES.picks).select('member_id, player_name, fantasy_pts, room_id').order('fantasy_pts', { ascending: false }).limit(50);
-    setLeaderboard(data || []);
-    setView('leaderboard');
+    const { data } = await supabase.from(TABLES.users).select('*').order('created_at', { ascending: true }).limit(20)
+    setLeaderboard(data || [])
   }
 
-  /* ===================== BOT ARENA ===================== */
-  async function startBotArena() {
-    setBotDrafting(true); setBotResults(null); setView('bot');
-    const pool = featured.length ? [...featured] : [];
-    if (!pool.length) { notify('Loading players...', 'error'); setBotDrafting(false); return; }
-    const userTeam = [], botTeam = [];
-    const shuffled = pool.sort(() => Math.random() - 0.5);
-    for (let i = 0; i < Math.min(6, shuffled.length); i++) {
-      await wait(600);
-      if (i % 2 === 0) userTeam.push({ ...shuffled[i], pts: fantasyPts() });
-      else botTeam.push({ ...shuffled[i], pts: fantasyPts() });
+  /* ── Bot Arena ── */
+  async function startBotDraft() {
+    setFeaturedLoading(true)
+    const players = await loadFeaturedPlayers()
+    setFeaturedLoading(false)
+    if (players.length < 8) return toast('Could not load enough players', 'error')
+    setBotPlayers(players)
+    setBotMyRoster([])
+    setBotCpuRoster([])
+    setBotPickIdx(0)
+    setBotState('drafting')
+    setBotTimer(PICK_TIME)
+    startBotTimer()
+    toast('Bot Draft started! You pick first.', 'success')
+  }
+
+  function startBotTimer() {
+    setBotTimer(PICK_TIME)
+    clearInterval(botTimerRef.current)
+    botTimerRef.current = setInterval(() => {
+      setBotTimer(prev => {
+        if (prev <= 1) {
+          clearInterval(botTimerRef.current)
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+  }
+
+  function botMakePick(player) {
+    if (botState !== 'drafting') return
+    const isMyTurn = botPickIdx % 2 === 0
+    if (!isMyTurn) return toast('CPU is picking...', 'error')
+    setBotMyRoster(prev => [...prev, player])
+    setBotPlayers(prev => prev.filter(p => p.id !== player.id))
+    toast(`You drafted ${player.name}! 🔥`, 'success')
+    const nextIdx = botPickIdx + 1
+    setBotPickIdx(nextIdx)
+    if (nextIdx >= 8) {
+      finishBotDraft()
+    } else {
+      // CPU turn
+      clearInterval(botTimerRef.current)
+      setTimeout(() => cpuPick(nextIdx), 1000)
     }
-    const uTotal = userTeam.reduce((s, p) => s + p.pts, 0);
-    const bTotal = botTeam.reduce((s, p) => s + p.pts, 0);
-    setBotResults({ userTeam, botTeam, uTotal, bTotal, win: uTotal > bTotal });
-    setBotDrafting(false);
-    if (user) {
-      await supabase.from(TABLES.botMatches).insert({
-        user_id: user.id, user_pts: uTotal, bot_pts: bTotal, won: uTotal > bTotal
-      });
+  }
+
+  function cpuPick(idx) {
+    setBotPlayers(prev => {
+      if (prev.length === 0) return prev
+      const best = [...prev].sort((a, b) => b.fantasyPts - a.fantasyPts)[0]
+      setBotCpuRoster(r => [...r, best])
+      toast(`CPU drafted ${best.name} 🤖`, 'info')
+      const nextIdx = idx + 1
+      setBotPickIdx(nextIdx)
+      if (nextIdx >= 8) {
+        finishBotDraft()
+        return prev.filter(p => p.id !== best.id)
+      }
+      startBotTimer()
+      return prev.filter(p => p.id !== best.id)
+    })
+  }
+
+  function finishBotDraft() {
+    clearInterval(botTimerRef.current)
+    setBotState('complete')
+    toast('Bot draft complete! 🏆', 'success')
+  }
+
+  /* ── Bot search ── */
+  useEffect(() => {
+    if (!botSearch || botSearch.length < 2) { setBotSearchResults([]); return }
+    setBotSearching(true)
+    const timeout = setTimeout(async () => {
+      const results = await searchPlayers(botSearch)
+      setBotSearchResults(results)
+      setBotSearching(false)
+    }, 400)
+    return () => clearTimeout(timeout)
+  }, [botSearch])
+
+  /* ── Cleanup timers ── */
+  useEffect(() => {
+    return () => {
+      clearInterval(timerRef.current)
+      clearInterval(botTimerRef.current)
     }
+  }, [])
+
+  /* ═══════════════════════════════════════
+     RENDER
+     ═══════════════════════════════════════ */
+  if (authLoading) {
+    return <div className="app-loading"><div className="loading-orb" /><p>Loading Dream Team...</p></div>
   }
 
-  /* ===================== SEARCH ===================== */
-  const debounceRef = useRef(null);
-  function handleSearch(val) {
-    setSearchTerm(val);
-    clearTimeout(debounceRef.current);
-    if (val.length < 2) { setSearchResults([]); return; }
-    debounceRef.current = setTimeout(async () => {
-      setSearching(true);
-      const r = await searchPlayers(val);
-      setSearchResults(r);
-      setSearching(false);
-    }, 350);
-  }
-
-  /* ===================== HELPERS ===================== */
-  function notify(msg, type = 'info') { setToast({ msg, type, key: Date.now() }); }
-  function myPicks() { return picks.filter(p => p.member_id === members.find(m => m.user_id === user?.id)?.id); }
-  function isMyTurn() {
-    if (!draftStarted || !draftOrder.length) return false;
-    const mem = members.find(m => m.user_id === user?.id);
-    return mem && draftOrder[currentPick] === mem.id;
-  }
-
-  /* ===================== RENDER ===================== */
+  /* ── Auth screen ── */
   if (!user) {
     return (
-      <div className="app auth-screen">
-        <ThreeCourtHero />
-        <div className="auth-card glass-panel">
-          <h1 className="brand">ð Dream Team</h1>
-          <p className="brand-sub">Fantasy Draft</p>
+      <div className="auth-page">
+        <ToastContainer toasts={toasts} />
+        <div className="auth-card">
+          <div className="auth-logo">🏀</div>
+          <h1 className="auth-title">Dream Team</h1>
+          <p className="auth-sub">Fantasy Draft</p>
           <div className="auth-tabs">
-            <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')}>Login</button>
-            <button className={authMode === 'signup' ? 'active' : ''} onClick={() => setAuthMode('signup')}>Sign Up</button>
+            <button className={`auth-tab ${authView === 'login' ? 'active' : ''}`} onClick={() => setAuthView('login')}>Login</button>
+            <button className={`auth-tab ${authView === 'signup' ? 'active' : ''}`} onClick={() => setAuthView('signup')}>Sign Up</button>
           </div>
-          {authErr && <p className="auth-error">{authErr}</p>}
-          <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
-          <input placeholder="Password" type="password" value={pw} onChange={e => setPw(e.target.value)} />
-          <button className="btn-accent" onClick={handleAuth} disabled={authLoading}>
-            {authLoading ? 'Loading...' : authMode === 'login' ? 'Sign In' : 'Create Account'}
-          </button>
+          {authView === 'signup' && (
+            <input className="auth-input" placeholder="Display Name" value={displayName} onChange={e => setDisplayName(e.target.value)} />
+          )}
+          <input className="auth-input" type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
+          <input className="auth-input" type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleAuth()} />
+          {authError && <p className="auth-error">{authError}</p>}
+          <button className="btn-primary" onClick={handleAuth}>{authView === 'login' ? 'Sign In' : 'Create Account'}</button>
         </div>
-        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
       </div>
-    );
+    )
   }
 
-  /* ---- Dashboard ---- */
-  if (view === 'dash') {
+  /* ── Nav ── */
+  const NavBar = () => (
+    <nav className="nav-bar">
+      <button className={`nav-btn ${view === 'dashboard' ? 'active' : ''}`} onClick={() => { setView('dashboard'); setCurrentRoom(null) }}>🏠</button>
+      <button className={`nav-btn ${view === 'bot' ? 'active' : ''}`} onClick={() => setView('bot')}>🤖</button>
+      <button className={`nav-btn ${view === 'leaderboard' ? 'active' : ''}`} onClick={() => { setView('leaderboard'); loadLeaderboard() }}>🏆</button>
+      <button className={`nav-btn ${view === 'profile' ? 'active' : ''}`} onClick={() => { setView('profile'); loadProfile() }}>👤</button>
+    </nav>
+  )
+
+  /* ── Dashboard ── */
+  if (view === 'dashboard' && !currentRoom) {
     return (
       <div className="app">
-        <header className="top-bar glass-panel">
-          <span className="logo">ð Dream Team</span>
-          <nav>
-            <button onClick={() => setView('profile')}>ð§</button>
-            <button onClick={loadLeaderboard}>ð</button>
-            <button onClick={logout}>â</button>
-          </nav>
-        </header>
-
-        <div className="dash">
-          <h2>Welcome, {profile?.display_name || 'Player'}!</h2>
-
-          <div className="dash-grid">
-            <div className="dash-card glass-panel" onClick={createRoom}>
-              <span className="dash-icon">ð</span>
-              <h3>Create Room</h3>
-              <p>Start a new draft room</p>
-            </div>
-            <div className="dash-card glass-panel" onClick={() => {
-              const code = prompt('Enter room code:');
-              if (code) joinByCode(code);
-            }}>
-              <span className="dash-icon">ð</span>
-              <h3>Join Room</h3>
-              <p>Enter with a code</p>
-            </div>
-            <div className="dash-card glass-panel" onClick={startBotArena}>
-              <span className="dash-icon">ð¤</span>
-              <h3>Bot Arena</h3>
-              <p>Draft vs AI opponent</p>
-            </div>
-            <div className="dash-card glass-panel" onClick={loadLeaderboard}>
-              <span className="dash-icon">ð</span>
-              <h3>Leaderboard</h3>
-              <p>Top fantasy scores</p>
-            </div>
-          </div>
-
-          <h3 className="section-title">Open Rooms</h3>
+        <ToastContainer toasts={toasts} />
+        <div className="page">
+          <ThreeCourtHero />
+          <h2 className="section-title">🏟️ Your Draft Rooms</h2>
           <div className="room-list">
-            {rooms.length === 0 && <p className="empty">No rooms yet â create one!</p>}
+            {rooms.length === 0 && <p className="empty-msg">No rooms yet. Create or join one!</p>}
             {rooms.map(r => (
-              <div key={r.id} className="room-card glass-panel" onClick={() => joinRoom(r)}>
-                <div className="room-info">
-                  <strong>{r.name}</strong>
-                  <span className="room-code">Code: {r.code}</span>
+              <div key={r.id} className="room-card" onClick={() => enterRoom(r)}>
+                <div className="room-card-header">
+                  <span className="room-name">{r.name}</span>
+                  <span className={`room-status status-${r.status}`}>{r.status}</span>
                 </div>
-                <span className={`room-status s-${r.status}`}>{r.status} Â· {r.max_players} max</span>
+                <div className="room-card-footer">
+                  <span>Code: <b>{r.code}</b></span>
+                  <span>{r.max_slots} slots</span>
+                </div>
               </div>
             ))}
           </div>
+
+          <div className="section-divider" />
+
+          <h3 className="section-title">➕ Create Room</h3>
+          <div className="form-row">
+            <input className="input" placeholder="Room Name" value={newRoomName} onChange={e => setNewRoomName(e.target.value)} />
+            <select className="input select" value={newRoomSlots} onChange={e => setNewRoomSlots(+e.target.value)}>
+              {[2, 4, 6, 8].map(n => <option key={n} value={n}>{n} players</option>)}
+            </select>
+          </div>
+          <button className="btn-primary" onClick={createRoom}>Create Room</button>
+
+          <div className="section-divider" />
+
+          <h3 className="section-title">🔗 Join Room</h3>
+          <div className="form-row">
+            <input className="input" placeholder="Room Code" value={joinCode} onChange={e => setJoinCode(e.target.value)} />
+            <button className="btn-secondary" onClick={joinRoom}>Join</button>
+          </div>
         </div>
-        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+        <NavBar />
       </div>
-    );
+    )
   }
 
-  /* ---- Profile ---- */
-  if (view === 'profile') {
+  /* ── Room / Draft view ── */
+  if (view === 'room' && currentRoom) {
+    const isOwner = currentRoom.user_id === user.id
+    const isMyTurn = draftState === 'active' && draftOrder[currentPickIdx] === user.id
+    const currentDrafter = roomMembers.find(m => m.user_id === draftOrder[currentPickIdx])
+
     return (
       <div className="app">
-        <header className="top-bar glass-panel">
-          <button onClick={() => setView('dash')}>â Back</button>
-          <span className="logo">Profile</span>
-        </header>
-        <div className="profile-page">
-          <div className="avatar-big">{avatar}</div>
-          <div className="avatar-picker">
-            {avatarChoices.map(a => (
-              <button key={a} className={a === avatar ? 'active' : ''} onClick={() => setAvatar(a)}>{a}</button>
+        <ToastContainer toasts={toasts} />
+        <div className="page">
+          <div className="room-header">
+            <button className="btn-back" onClick={() => { setView('dashboard'); setCurrentRoom(null); clearInterval(timerRef.current) }}>← Back</button>
+            <div>
+              <h2 className="room-title">{currentRoom.name}</h2>
+              <p className="room-code">Code: {currentRoom.code}</p>
+            </div>
+          </div>
+
+          {/* Members */}
+          <div className="members-row">
+            {roomMembers.map(m => (
+              <div key={m.id} className={`member-chip ${draftState === 'active' && draftOrder[currentPickIdx] === m.user_id ? 'picking' : ''}`}>
+                <span className="member-avatar">👤</span>
+                <span>{m.display_name || 'Player'}</span>
+              </div>
             ))}
           </div>
-          <input placeholder="Display Name" value={displayName} onChange={e => setDisplayName(e.target.value)} />
-          <button className="btn-accent" onClick={saveProfile}>Save Profile</button>
+
+          {/* Draft controls */}
+          {draftState === 'waiting' && isOwner && (
+            <button className="btn-primary btn-large" onClick={startDraft}>🚀 Start Draft</button>
+          )}
+          {draftState === 'waiting' && !isOwner && (
+            <p className="waiting-msg">Waiting for host to start the draft...</p>
+          )}
+
+          {draftState === 'active' && (
+            <>
+              <div className="draft-status-bar">
+                <div className="draft-turn">
+                  {isMyTurn ? '🟢 YOUR PICK!' : `⏳ ${currentDrafter?.display_name || 'Player'}'s pick`}
+                </div>
+                <div className="draft-timer">
+                  <div className="timer-ring">{timer}s</div>
+                </div>
+                <div className="draft-round">Pick {currentPickIdx + 1} / {draftOrder.length}</div>
+              </div>
+
+              {/* Search */}
+              <input className="input search-input" placeholder="🔍 Search NBA players..." value={playerSearch} onChange={e => setPlayerSearch(e.target.value)} />
+
+              {/* Search results or available players */}
+              <div className="player-grid">
+                {(searchResults.length > 0 ? searchResults : availablePlayers).map((player, idx) => (
+                  <div key={player.id} className="player-card" style={{ animationDelay: `${idx * 0.05}s` }}>
+                    <div className="player-card-img">
+                      {player.thumb ? <img src={player.thumb} alt={player.name} /> : <span className="player-emoji">🏀</span>}
+                    </div>
+                    <div className="player-card-info">
+                      <span className="player-name">{player.name}</span>
+                      <span className="player-team">{player.team}</span>
+                      <span className="player-pos">{player.position}</span>
+                      <span className="player-pts">{player.fantasyPts} FP</span>
+                    </div>
+                    <button className="btn-draft" onClick={() => makePick(player)} disabled={!isMyTurn}>Draft</button>
+                  </div>
+                ))}
+                {searching && <p className="searching-msg">Searching...</p>}
+              </div>
+
+              {/* My roster */}
+              {myRoster.length > 0 && (
+                <>
+                  <h3 className="section-title">📋 My Roster ({myRoster.length}/{MAX_ROSTER})</h3>
+                  <div className="roster-list">
+                    {myRoster.map(p => (
+                      <div key={p.pick_number} className="roster-item">
+                        <span className="roster-pick">#{p.pick_number}</span>
+                        <span className="roster-name">{p.player_name}</span>
+                        <span className="roster-team">{p.player_team}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {/* Complete */}
+          {draftState === 'complete' && (
+            <>
+              <div className="draft-complete-banner">🏆 Draft Complete!</div>
+              {matchups.length > 0 && (
+                <>
+                  <h3 className="section-title">⚔️ Matchups</h3>
+                  <div className="matchup-list">
+                    {matchups.map((m, i) => (
+                      <div key={i} className="matchup-card">
+                        <div className="matchup-team">
+                          <span>Team {(roomMembers.findIndex(rm => rm.user_id === m.user_a) + 1) || '?'}</span>
+                          <span className="matchup-score">{m.score_a}</span>
+                        </div>
+                        <span className="matchup-vs">VS</span>
+                        <div className="matchup-team">
+                          <span>Team {(roomMembers.findIndex(rm => rm.user_id === m.user_b) + 1) || '?'}</span>
+                          <span className="matchup-score">{m.score_b}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
         </div>
-        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+        <NavBar />
       </div>
-    );
+    )
   }
 
-  /* ---- Leaderboard ---- */
+  /* ── Bot Arena ── */
+  if (view === 'bot') {
+    const isMyTurn = botState === 'drafting' && botPickIdx % 2 === 0
+    return (
+      <div className="app">
+        <ToastContainer toasts={toasts} />
+        <div className="page">
+          <h2 className="section-title">🤖 Bot Arena</h2>
+          <p className="subtitle">Draft against the CPU. Snake draft, 4 picks each.</p>
+
+          {botState === 'idle' && (
+            <button className="btn-primary btn-large" onClick={startBotDraft} disabled={featuredLoading}>
+              {featuredLoading ? 'Loading Players...' : '⚡ Start Bot Draft'}
+            </button>
+          )}
+
+          {botState === 'drafting' && (
+            <>
+              <div className="draft-status-bar">
+                <div className="draft-turn">
+                  {isMyTurn ? '🟢 YOUR PICK!' : '🤖 CPU picking...'}
+                </div>
+                <div className="draft-timer"><div className="timer-ring">{botTimer}s</div></div>
+                <div className="draft-round">Pick {botPickIdx + 1} / 8</div>
+              </div>
+
+              <input className="input search-input" placeholder="🔍 Search NBA players..." value={botSearch} onChange={e => setBotSearch(e.target.value)} />
+
+              <div className="player-grid">
+                {(botSearchResults.length > 0 ? botSearchResults : botPlayers).map((player, idx) => (
+                  <div key={player.id} className="player-card" style={{ animationDelay: `${idx * 0.05}s` }}>
+                    <div className="player-card-img">
+                      {player.thumb ? <img src={player.thumb} alt={player.name} /> : <span className="player-emoji">🏀</span>}
+                    </div>
+                    <div className="player-card-info">
+                      <span className="player-name">{player.name}</span>
+                      <span className="player-team">{player.team}</span>
+                      <span className="player-pos">{player.position}</span>
+                      <span className="player-pts">{player.fantasyPts} FP</span>
+                    </div>
+                    <button className="btn-draft" onClick={() => botMakePick(player)} disabled={!isMyTurn}>Draft</button>
+                  </div>
+                ))}
+                {botSearching && <p className="searching-msg">Searching...</p>}
+              </div>
+            </>
+          )}
+
+          {(botMyRoster.length > 0 || botCpuRoster.length > 0) && (
+            <div className="bot-rosters">
+              <div className="bot-roster">
+                <h4>📋 Your Team</h4>
+                {botMyRoster.map((p, i) => <div key={i} className="roster-item"><span className="roster-name">{p.name}</span><span className="roster-team">{p.team}</span></div>)}
+              </div>
+              <div className="bot-roster cpu">
+                <h4>🤖 CPU Team</h4>
+                {botCpuRoster.map((p, i) => <div key={i} className="roster-item"><span className="roster-name">{p.name}</span><span className="roster-team">{p.team}</span></div>)}
+              </div>
+            </div>
+          )}
+
+          {botState === 'complete' && (
+            <>
+              <div className="draft-complete-banner">🏆 Bot Draft Complete!</div>
+              <div className="matchup-card">
+                <div className="matchup-team">
+                  <span>You</span>
+                  <span className="matchup-score">{botMyRoster.reduce((s, p) => s + (p.fantasyPts || 0), 0)}</span>
+                </div>
+                <span className="matchup-vs">VS</span>
+                <div className="matchup-team">
+                  <span>CPU</span>
+                  <span className="matchup-score">{botCpuRoster.reduce((s, p) => s + (p.fantasyPts || 0), 0)}</span>
+                </div>
+              </div>
+              <button className="btn-primary" onClick={() => setBotState('idle')} style={{ marginTop: 16 }}>Play Again</button>
+            </>
+          )}
+        </div>
+        <NavBar />
+      </div>
+    )
+  }
+
+  /* ── Leaderboard ── */
   if (view === 'leaderboard') {
     return (
       <div className="app">
-        <header className="top-bar glass-panel">
-          <button onClick={() => setView('dash')}>â Back</button>
-          <span className="logo">ð Leaderboard</span>
-        </header>
-        <div className="leaderboard">
-          {leaderboard.length === 0 && <p className="empty">No picks yet</p>}
-          {leaderboard.map((entry, i) => (
-            <div key={i} className="lb-row glass-panel">
-              <span className="lb-rank">#{i + 1}</span>
-              <span className="lb-name">{entry.player_name}</span>
-              <span className="lb-pts">{entry.fantasy_pts} pts</span>
-            </div>
-          ))}
-        </div>
-        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
-      </div>
-    );
-  }
-
-  /* ---- Bot Arena ---- */
-  if (view === 'bot') {
-    return (
-      <div className="app">
-        <header className="top-bar glass-panel">
-          <button onClick={() => setView('dash')}>â Back</button>
-          <span className="logo">ð¤ Bot Arena</span>
-        </header>
-        <div className="bot-arena">
-          {botDrafting && <div className="bot-loading"><div className="spinner"></div><p>Drafting against AI...</p></div>}
-          {botResults && (
-            <div className="bot-results">
-              <h2 className={botResults.win ? 'win' : 'lose'}>{botResults.win ? 'ð You Win!' : 'ð¤ Bot Wins!'}</h2>
-              <div className="bot-matchup">
-                <div className="bot-team">
-                  <h3>Your Team ({botResults.uTotal} pts)</h3>
-                  {botResults.userTeam.map((p, i) => (
-                    <div key={i} className="bot-player">
-                      {p.thumb && <img src={p.thumb} alt={p.name} />}
-                      <span>{p.name}</span>
-                      <span className="pts">{p.pts}</span>
-                    </div>
-                  ))}
-                </div>
-                <div className="bot-vs">VS</div>
-                <div className="bot-team">
-                  <h3>Bot ({botResults.bTotal} pts)</h3>
-                  {botResults.botTeam.map((p, i) => (
-                    <div key={i} className="bot-player">
-                      {p.thumb && <img src={p.thumb} alt={p.name} />}
-                      <span>{p.name}</span>
-                      <span className="pts">{p.pts}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <button className="btn-accent" onClick={startBotArena}>Rematch</button>
-            </div>
-          )}
-        </div>
-        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
-      </div>
-    );
-  }
-
-  /* ---- Draft Room ---- */
-  return (
-    <div className="app">
-      <header className="top-bar glass-panel">
-        <button onClick={() => { setView('dash'); setCurrentRoom(null); }}>â Back</button>
-        <span className="logo">{currentRoom?.name || 'Draft Room'}</span>
-        <span className="room-code-badge">{currentRoom?.code}</span>
-      </header>
-
-      {/* Draft HUD */}
-      <div className="draft-hud glass-panel">
-        <div className="hud-item">
-          <span className="hud-label">Round</span>
-          <span className="hud-val">{Math.floor(currentPick / Math.max(members.length, 1)) + 1}</span>
-        </div>
-        <div className="hud-item">
-          <span className="hud-label">Pick</span>
-          <span className="hud-val">{currentPick + 1}/{draftOrder.length || '?'}</span>
-        </div>
-        <div className="hud-item">
-          <span className="hud-label">Timer</span>
-          <span className={`hud-val timer ${timeLeft <= 10 ? 'urgent' : ''}`}>{timeLeft}s</span>
-        </div>
-      </div>
-
-      {/* Members bar */}
-      <div className="members-bar">
-        {members.map(m => (
-          <div key={m.id} className={`member-chip ${draftStarted && draftOrder[currentPick] === m.id ? 'active' : ''}`}>
-            <span className="member-avatar">{m.avatar || 'ð'}</span>
-            <span className="member-name">{m.display_name}</span>
-          </div>
-        ))}
-      </div>
-
-      {!draftStarted && (
-        <div className="draft-actions">
-          <button className="btn-accent big" onClick={startDraft}>ð Start Draft</button>
-          <p className="hint">{members.length} player{members.length !== 1 ? 's' : ''} in room</p>
-        </div>
-      )}
-
-      {/* Search */}
-      {draftStarted && isMyTurn() && (
-        <div className="search-section">
-          <input placeholder="Search NBA players..." value={searchTerm} onChange={e => handleSearch(e.target.value)} className="search-input" />
-          {searching && <div className="spinner small"></div>}
-        </div>
-      )}
-
-      {/* Player grid */}
-      <div className="player-grid">
-        {(searchResults.length ? searchResults : featured).map(p => {
-          const drafted = picks.some(pk => pk.player_id === p.id);
-          return (
-            <div key={p.id} className={`player-card glass-panel ${drafted ? 'drafted' : ''}`}>
-              <div className="player-visual">
-                {p.thumb ? <img src={p.thumb} alt={p.name} /> : <div className="player-fallback">ð</div>}
-              </div>
-              <div className="player-info">
-                <h4>{p.name}</h4>
-                <p className="player-team">{p.team} Â· {p.pos}</p>
-              </div>
-              {draftStarted && isMyTurn() && !drafted && (
-                <button className="draft-btn" onClick={() => draftPlayer(p)}>Draft</button>
-              )}
-              {drafted && <span className="drafted-badge">Drafted</span>}
-            </div>
-          );
-        })}
-      </div>
-
-      {/* My Picks */}
-      {picks.length > 0 && (
-        <div className="my-picks">
-          <h3>ð My Picks</h3>
-          <div className="pick-list">
-            {myPicks().map((p, i) => (
-              <div key={i} className="pick-chip">
-                {p.player_thumb && <img src={p.player_thumb} alt="" />}
-                <span>{p.player_name}</span>
-                <span className="pick-pts">{p.fantasy_pts} pts</span>
+        <ToastContainer toasts={toasts} />
+        <div className="page">
+          <h2 className="section-title">🏆 Leaderboard</h2>
+          <div className="leaderboard-list">
+            {leaderboard.map((u, i) => (
+              <div key={u.id} className="leaderboard-row">
+                <span className="lb-rank">#{i + 1}</span>
+                <span className="lb-name">{u.display_name || u.email || 'Player'}</span>
               </div>
             ))}
+            {leaderboard.length === 0 && <p className="empty-msg">No players yet.</p>}
           </div>
         </div>
-      )}
+        <NavBar />
+      </div>
+    )
+  }
 
-      {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+  /* ── Profile ── */
+  if (view === 'profile') {
+    return (
+      <div className="app">
+        <ToastContainer toasts={toasts} />
+        <div className="page">
+          <h2 className="section-title">👤 Profile</h2>
+          {profileLoading ? (
+            <div className="loading-spinner" />
+          ) : (
+            <div className="profile-card">
+              <div className="profile-avatar">🏀</div>
+              <h3>{profile?.display_name || user.email}</h3>
+              <p className="profile-email">{user.email}</p>
+            </div>
+          )}
+          <button className="btn-danger" onClick={logout} style={{ marginTop: 24 }}>Sign Out</button>
+        </div>
+        <NavBar />
+      </div>
+    )
+  }
+
+  return (
+    <div className="app">
+      <ToastContainer toasts={toasts} />
+      <div className="page"><p>Unknown view</p></div>
+      <NavBar />
     </div>
-  );
+  )
 }
