@@ -1,911 +1,605 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { supabase, TABLES } from './supabaseClient'
-import { fetchLeagueMeta, loadFeaturedPlayers, searchPlayers } from './nbaApi'
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { supabase, TABLES } from './supabaseClient';
+import { searchPlayers, loadFeaturedPlayers } from './nbaApi';
 
-const avatarChoices = ['🏀', '🔥', '⚡', '👑', '🎯', '🚀', '💎', '🛡️']
-const botNames = ['Pixel Phantoms', 'Neon Ninjas', 'Stat Goblins', 'Backboard Bots', 'Turbo Titans']
+/* ========== tiny helpers ========== */
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const randId = () => Math.random().toString(36).slice(2, 10);
+const fantasyPts = () => Math.floor(Math.random() * 30 + 10);
 
-const initialAuth = { email: '', password: '' }
-const initialRoom = { name: '', teamName: '' }
-const initialBotGame = { difficulty: 'medium', humanTeamName: '', botTeamName: '' }
-
-function makeInviteCode() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase()
-}
-
-function normalizeUserName(profile, user) {
-  return profile?.username?.trim() || user?.email?.split('@')[0] || 'GM'
-}
-
-function buildSnakeOrder(members) {
-  const sorted = [...members].sort((a, b) => (a.joined_at || '').localeCompare(b.joined_at || ''))
-  const ids = sorted.map((member) => member.member_user_id)
-  return [...ids, ...[...ids].reverse()]
-}
-
-function scoreRoster(picks, playerPool) {
-  return picks.reduce((sum, pick) => {
-    const player = playerPool.find((item) => item.player_id === pick.player_id)
-    return sum + Number(player?.fantasy_points || 0)
-  }, 0)
-}
-
-function getDifficultyBoost(difficulty) {
-  if (difficulty === 'easy') return -8
-  if (difficulty === 'hard') return 10
-  return 2
-}
-
-function createBotSummary(humanScore, botScore, difficulty) {
-  if (humanScore > botScore) return `You outscored the ${difficulty} bot with smarter NBA drafting and better weekly upside.`
-  if (humanScore < botScore) return `The ${difficulty} bot edged you this round with a tighter projected lineup.`
-  return `Dead heat. The ${difficulty} bot matched your roster point for point.`
-}
-
+/* ========== Three-style hero (pure CSS orb) ========== */
 function ThreeCourtHero() {
-  const orbRef = useRef(null)
-
-  useEffect(() => {
-    let raf = 0
-    let frame = 0
-    const node = orbRef.current
-    function animate() {
-      try {
-        frame += 1
-        if (node) {
-          node.style.transform = `rotateY(${frame * 0.5}deg) rotateX(${12 + Math.sin(frame * 0.03) * 8}deg)`
-        }
-      } catch (error) {
-        console.error('Hero animation error:', error.message)
-      }
-      raf = window.requestAnimationFrame(animate)
-    }
-    animate()
-    return () => window.cancelAnimationFrame(raf)
-  }, [])
-
   return (
-    <div className="hero-3d-shell" aria-hidden="true">
-      <div className="court-glow"></div>
-      <div ref={orbRef} className="basketball-orb">
-        <span className="orb-line line-a"></span>
-        <span className="orb-line line-b"></span>
-        <span className="orb-line line-c"></span>
-        <span className="orb-line line-d"></span>
+    <div className="hero-3d">
+      <div className="court-orb">
+        <div className="orb-ring ring1"></div>
+        <div className="orb-ring ring2"></div>
+        <div className="orb-ring ring3"></div>
+        <div className="orb-core">ð</div>
       </div>
     </div>
-  )
+  );
 }
 
+/* ========== Toast ========== */
+function Toast({ msg, type, onDone }) {
+  useEffect(() => { const t = setTimeout(onDone, 2400); return () => clearTimeout(t); }, []);
+  return <div className={`toast toast-${type}`}>{msg}</div>;
+}
+
+/* ========== Main App ========== */
 export default function App() {
-  const [authMode, setAuthMode] = useState('login')
-  const [authForm, setAuthForm] = useState(initialAuth)
-  const [session, setSession] = useState(null)
-  const [user, setUser] = useState(null)
-  const [profile, setProfile] = useState(null)
-  const [settingsName, setSettingsName] = useState('')
-  const [settingsTeam, setSettingsTeam] = useState('')
-  const [toast, setToast] = useState('')
-  const [roomForm, setRoomForm] = useState(initialRoom)
-  const [joinCode, setJoinCode] = useState('')
-  const [botGameForm, setBotGameForm] = useState(initialBotGame)
-  const [rooms, setRooms] = useState([])
-  const [members, setMembers] = useState([])
-  const [picks, setPicks] = useState([])
-  const [matchups, setMatchups] = useState([])
-  const [botMatches, setBotMatches] = useState([])
-  const [players, setPlayers] = useState([])
-  const [featuredPlayers, setFeaturedPlayers] = useState([])
-  const [activeRoomId, setActiveRoomId] = useState(null)
-  const [searchTerm, setSearchTerm] = useState('')
-  const [searchResults, setSearchResults] = useState([])
-  const [leagueMeta, setLeagueMeta] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
+  /* --- auth --- */
+  const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [pw, setPw] = useState('');
+  const [authErr, setAuthErr] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
 
-  function showToast(message) {
-    setToast(message)
-    window.clearTimeout(showToast.timer)
-    showToast.timer = window.setTimeout(() => setToast(''), 2600)
-  }
+  /* --- nav --- */
+  const [view, setView] = useState('dash');        // dash | draft | profile | leaderboard | bot
+  const [toast, setToast] = useState(null);
 
-  async function ensureProfile(currentUser) {
-    const { data: existing, error: existingError } = await supabase
-      .from(TABLES.users)
-      .select('*')
-      .eq('user_id', currentUser.id)
-      .maybeSingle()
+  /* --- rooms --- */
+  const [rooms, setRooms] = useState([]);
+  const [currentRoom, setCurrentRoom] = useState(null);
+  const [members, setMembers] = useState([]);
 
-    if (existingError) throw existingError
-    if (existing) {
-      setProfile(existing)
-      setSettingsName(existing.username || '')
-      setSettingsTeam(existing.favorite_team || '')
-      return existing
-    }
+  /* --- draft --- */
+  const [draftOrder, setDraftOrder] = useState([]);
+  const [currentPick, setCurrentPick] = useState(0);
+  const [picks, setPicks] = useState([]);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [featured, setFeatured] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [draftStarted, setDraftStarted] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(0);
+  const timerRef = useRef(null);
 
-    const payload = {
-      email: currentUser.email,
-      username: '',
-      avatar_emoji: avatarChoices[Math.floor(Math.random() * avatarChoices.length)],
-      favorite_team: ''
-    }
+  /* --- leaderboard --- */
+  const [leaderboard, setLeaderboard] = useState([]);
 
-    const { data, error } = await supabase.from(TABLES.users).insert(payload).select('*').single()
-    if (error) throw error
-    setProfile(data)
-    return data
-  }
+  /* --- bot arena --- */
+  const [botDrafting, setBotDrafting] = useState(false);
+  const [botResults, setBotResults] = useState(null);
 
-  async function seedPlayersIfNeeded() {
-    const { data: existing, error: existingError } = await supabase.from(TABLES.players).select('*').limit(30)
-    if (existingError) throw existingError
-    if (existing && existing.length) {
-      setPlayers(existing)
-      return existing
-    }
+  /* --- profile --- */
+  const [displayName, setDisplayName] = useState('');
+  const [avatar, setAvatar] = useState('ð');
+  const avatarChoices = ['ð', 'ð¥', 'â¡', 'ð', 'ð¯', 'ð', 'ð', 'ð¡ï¸'];
 
-    const featured = await loadFeaturedPlayers()
-    if (!featured.length) {
-      setPlayers([])
-      return []
-    }
-
-    const { data, error } = await supabase.from(TABLES.players).insert(featured).select('*')
-    if (error) throw error
-    setPlayers(data || [])
-    return data || []
-  }
-
-  async function loadAppData(currentUser) {
-    const [roomRes, memberRes, pickRes, matchupRes, botRes] = await Promise.all([
-      supabase.from(TABLES.rooms).select('*').order('created_at', { ascending: false }),
-      supabase.from(TABLES.members).select('*').order('joined_at', { ascending: true }),
-      supabase.from(TABLES.picks).select('*').order('pick_number', { ascending: true }),
-      supabase.from(TABLES.matchups).select('*').order('created_at', { ascending: false }),
-      supabase.from(TABLES.botMatches).select('*').eq('owner_user_id', currentUser.id).order('created_at', { ascending: false })
-    ])
-
-    if (roomRes.error) throw roomRes.error
-    if (memberRes.error) throw memberRes.error
-    if (pickRes.error) throw pickRes.error
-    if (matchupRes.error) throw matchupRes.error
-    if (botRes.error) throw botRes.error
-
-    const roomData = roomRes.data || []
-    setRooms(roomData)
-    setMembers(memberRes.data || [])
-    setPicks(pickRes.data || [])
-    setMatchups(matchupRes.data || [])
-    setBotMatches(botRes.data || [])
-
-    if (!activeRoomId && roomData.length) {
-      const myRoom = roomData.find((room) => room.host_user_id === currentUser.id) || roomData[0]
-      setActiveRoomId(myRoom.id)
-    }
-  }
-
-  async function bootstrap(currentSession) {
-    try {
-      setLoading(true)
-      setSession(currentSession)
-      const currentUser = currentSession?.user || null
-      setUser(currentUser)
-      if (!currentUser) {
-        setProfile(null)
-        setRooms([])
-        setMembers([])
-        setPicks([])
-        setMatchups([])
-        setBotMatches([])
-        setActiveRoomId(null)
-        return
-      }
-      await ensureProfile(currentUser)
-      const [meta, featured] = await Promise.all([fetchLeagueMeta(), seedPlayersIfNeeded()])
-      setLeagueMeta(meta)
-      setFeaturedPlayers(featured)
-      await loadAppData(currentUser)
-    } catch (error) {
-      console.error('Bootstrap error:', error.message)
-      showToast(error.message || 'Could not load the fantasy app.')
-    } finally {
-      setLoading(false)
-    }
-  }
-
+  /* ===================== AUTH ===================== */
   useEffect(() => {
-    let mounted = true
-    async function init() {
-      try {
-        const { data: { session: currentSession } } = await supabase.auth.getSession()
-        if (mounted) await bootstrap(currentSession)
-      } catch (error) {
-        console.error('Init error:', error.message)
-      }
-    }
-    init()
-    const { data: listener } = supabase.auth.onAuthStateChange(async (_event, nextSession) => {
-      if (mounted) await bootstrap(nextSession)
-    })
-    return () => {
-      mounted = false
-      listener?.subscription?.unsubscribe?.()
-    }
-  }, [])
+    supabase.auth.getUser().then(({ data }) => {
+      if (data.user) { setUser(data.user); loadProfile(data.user.id); }
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_, s) => {
+      if (s?.user) { setUser(s.user); loadProfile(s.user.id); }
+      else { setUser(null); setProfile(null); }
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
 
-  useEffect(() => {
-    async function runSearch() {
-      try {
-        if (!searchTerm.trim()) {
-          setSearchResults([])
-          return
-        }
-        const results = await searchPlayers(searchTerm)
-        setSearchResults(results.slice(0, 8))
-      } catch (error) {
-        console.error('Search error:', error.message)
-      }
-    }
-    const timer = window.setTimeout(runSearch, 350)
-    return () => window.clearTimeout(timer)
-  }, [searchTerm])
+  async function loadProfile(uid) {
+    const { data } = await supabase.from(TABLES.users).select('*').eq('user_id', uid).maybeSingle();
+    if (data) { setProfile(data); setDisplayName(data.display_name || ''); setAvatar(data.avatar || 'ð'); }
+  }
 
-  const activeRoom = useMemo(() => rooms.find((room) => room.id === activeRoomId) || null, [rooms, activeRoomId])
-  const activeMembers = useMemo(() => members.filter((member) => member.room_id === activeRoomId), [members, activeRoomId])
-  const activePicks = useMemo(() => picks.filter((pick) => pick.room_id === activeRoomId), [picks, activeRoomId])
-  const activeMatchups = useMemo(() => matchups.filter((matchup) => matchup.room_id === activeRoomId), [matchups, activeRoomId])
-
-  const leaderboard = useMemo(() => {
-    return activeMembers.map((member) => {
-      const memberPicks = activePicks.filter((pick) => pick.picked_by_user_id === member.member_user_id)
-      const score = scoreRoster(memberPicks, players)
-      return {
-        ...member,
-        score
-      }
-    }).sort((a, b) => b.score - a.score)
-  }, [activeMembers, activePicks, players])
-
-  const botLeaderboard = useMemo(() => {
-    return botMatches.map((match) => ({
-      ...match,
-      margin: Number(match.human_score || 0) - Number(match.bot_score || 0)
-    }))
-  }, [botMatches])
-
-  async function handleAuthSubmit(event) {
-    event.preventDefault()
+  async function handleAuth() {
+    setAuthErr(''); setAuthLoading(true);
     try {
-      setSaving(true)
-      if (authMode === 'login') {
-        const { error } = await supabase.auth.signInWithPassword(authForm)
-        if (error) throw error
-        showToast('Welcome back to the draft room.')
-      } else {
+      if (authMode === 'signup') {
         const { error } = await supabase.auth.signUp({
-          ...authForm,
+          email, password: pw,
           options: { emailRedirectTo: 'https://sling-gogiapp.web.app/email-confirmed.html' }
-        })
-        if (error) throw error
-        showToast('Account created. Check your email if confirmation is enabled.')
-        setAuthMode('login')
+        });
+        if (error) throw error;
+        notify('Check your email to confirm!', 'success');
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password: pw });
+        if (error) throw error;
       }
-    } catch (error) {
-      console.error('Auth error:', error.message)
-      showToast(error.message || 'Authentication failed.')
-    } finally {
-      setSaving(false)
+    } catch (e) { setAuthErr(e.message); }
+    setAuthLoading(false);
+  }
+
+  async function logout() {
+    await supabase.auth.signOut();
+    setView('dash'); setCurrentRoom(null);
+  }
+
+  /* ===================== PROFILE ===================== */
+  async function saveProfile() {
+    if (!user) return;
+    const row = { user_id: user.id, display_name: displayName, avatar };
+    if (profile) {
+      await supabase.from(TABLES.users).update(row).eq('id', profile.id);
+    } else {
+      await supabase.from(TABLES.users).insert(row);
+    }
+    await loadProfile(user.id);
+    notify('Profile saved!', 'success');
+    setView('dash');
+  }
+
+  /* ===================== ROOMS ===================== */
+  useEffect(() => { if (user) fetchRooms(); }, [user]);
+
+  async function fetchRooms() {
+    const { data } = await supabase.from(TABLES.rooms).select('*').order('created_at', { ascending: false }).limit(20);
+    setRooms(data || []);
+  }
+
+  async function createRoom() {
+    if (!user) return;
+    const code = randId().toUpperCase().slice(0, 6);
+    const { data, error } = await supabase.from(TABLES.rooms).insert({
+      user_id: user.id, code, name: `${profile?.display_name || 'Player'}'s Room`,
+      max_players: 4, status: 'waiting'
+    }).select().single();
+    if (error) { notify(error.message, 'error'); return; }
+    await joinRoom(data);
+    notify(`Room ${code} created!`, 'success');
+  }
+
+  async function joinRoom(room) {
+    if (!user) return;
+    const existing = await supabase.from(TABLES.members).select('id').eq('room_id', room.id).eq('user_id', user.id).maybeSingle();
+    if (!existing.data) {
+      await supabase.from(TABLES.members).insert({ user_id: user.id, room_id: room.id, display_name: profile?.display_name || 'Player', avatar: avatar });
+    }
+    setCurrentRoom(room);
+    await loadMembers(room.id);
+    setView('draft');
+    await loadDraft(room.id);
+  }
+
+  async function joinByCode(code) {
+    const { data } = await supabase.from(TABLES.rooms).select('*').eq('code', code.toUpperCase()).maybeSingle();
+    if (data) joinRoom(data);
+    else notify('Room not found', 'error');
+  }
+
+  async function loadMembers(roomId) {
+    const { data } = await supabase.from(TABLES.members).select('*').eq('room_id', roomId);
+    setMembers(data || []);
+    return data || [];
+  }
+
+  /* ===================== DRAFT ===================== */
+  useEffect(() => { loadFeaturedPlayers().then(f => setFeatured(f)); }, []);
+
+  async function loadDraft(roomId) {
+    const { data: p } = await supabase.from(TABLES.picks).select('*').eq('room_id', roomId).order('pick_number');
+    setPicks(p || []);
+    if (p && p.length) {
+      setCurrentPick(p.length);
+      setDraftStarted(true);
     }
   }
 
-  async function handleLogout() {
-    try {
-      const { error } = await supabase.auth.signOut()
-      if (error) throw error
-      showToast('Logged out.')
-    } catch (error) {
-      console.error('Logout error:', error.message)
-      showToast('Could not log out.')
+  function buildSnakeOrder(membersList, rounds = 3) {
+    const order = [];
+    for (let r = 0; r < rounds; r++) {
+      const arr = membersList.map(m => m.id);
+      if (r % 2 === 1) arr.reverse();
+      order.push(...arr);
     }
-  }
-
-  async function saveSettings(event) {
-    event.preventDefault()
-    try {
-      const { data, error } = await supabase
-        .from(TABLES.users)
-        .update({ username: settingsName.trim(), favorite_team: settingsTeam.trim() })
-        .eq('user_id', user.id)
-        .select('*')
-        .single()
-      if (error) throw error
-      setProfile(data)
-      showToast('Profile updated.')
-    } catch (error) {
-      console.error('Settings error:', error.message)
-      showToast('Could not save your profile.')
-    }
-  }
-
-  async function createRoom(event) {
-    event.preventDefault()
-    try {
-      if (!roomForm.name.trim()) {
-        showToast('Give your draft room a name first.')
-        return
-      }
-      const inviteCode = makeInviteCode()
-      const roomPayload = {
-        name: roomForm.name.trim(),
-        sport: 'NBA',
-        host_user_id: user.id,
-        invite_code: inviteCode,
-        status: 'waiting',
-        draft_order: [user.id],
-        current_pick_number: 1,
-        current_turn_user_id: user.id,
-        max_members: 8
-      }
-      const { data: room, error: roomError } = await supabase.from(TABLES.rooms).insert(roomPayload).select('*').single()
-      if (roomError) throw roomError
-
-      const memberPayload = {
-        room_id: room.id,
-        member_user_id: user.id,
-        role: 'host',
-        joined_at: new Date().toISOString(),
-        team_name: roomForm.teamName.trim() || `${normalizeUserName(profile, user)} All-Stars`,
-        draft_position: 1
-      }
-      const { error: memberError } = await supabase.from(TABLES.members).insert(memberPayload)
-      if (memberError) throw memberError
-
-      setRoomForm(initialRoom)
-      setActiveRoomId(room.id)
-      showToast(`Room created. Invite code: ${inviteCode}`)
-      await loadAppData(user)
-    } catch (error) {
-      console.error('Create room error:', error.message)
-      showToast('Could not create the room.')
-    }
-  }
-
-  async function joinRoom(event) {
-    event.preventDefault()
-    try {
-      const code = joinCode.trim().toUpperCase()
-      if (!code) {
-        showToast('Enter an invite code.')
-        return
-      }
-      const { data: room, error: roomError } = await supabase.from(TABLES.rooms).select('*').eq('invite_code', code).maybeSingle()
-      if (roomError) throw roomError
-      if (!room) {
-        showToast('No room found for that invite code.')
-        return
-      }
-
-      const { data: existingMember, error: existingError } = await supabase
-        .from(TABLES.members)
-        .select('*')
-        .eq('room_id', room.id)
-        .eq('member_user_id', user.id)
-        .maybeSingle()
-      if (existingError) throw existingError
-
-      if (!existingMember) {
-        const roomMembers = members.filter((member) => member.room_id === room.id)
-        const { error: joinError } = await supabase.from(TABLES.members).insert({
-          room_id: room.id,
-          member_user_id: user.id,
-          role: 'player',
-          joined_at: new Date().toISOString(),
-          team_name: `${normalizeUserName(profile, user)} Squad`,
-          draft_position: roomMembers.length + 1
-        })
-        if (joinError) throw joinError
-      }
-
-      setJoinCode('')
-      setActiveRoomId(room.id)
-      showToast(`Joined ${room.name}.`)
-      await loadAppData(user)
-    } catch (error) {
-      console.error('Join room error:', error.message)
-      showToast('Could not join that room.')
-    }
+    return order;
   }
 
   async function startDraft() {
-    try {
-      if (!activeRoom) {
-        showToast('Select a room first.')
-        return
-      }
-      if (activeMembers.length < 2) {
-        showToast('You need at least two managers to start.')
-        return
-      }
-      const snakeOrder = buildSnakeOrder(activeMembers)
-      const { error } = await supabase
-        .from(TABLES.rooms)
-        .update({
-          status: 'live',
-          draft_order: snakeOrder,
-          current_pick_number: 1,
-          current_turn_user_id: snakeOrder[0]
-        })
-        .eq('id', activeRoom.id)
-      if (error) throw error
-      showToast('Draft is live.')
-      await loadAppData(user)
-    } catch (error) {
-      console.error('Start draft error:', error.message)
-      showToast('Could not start the draft.')
+    if (!currentRoom) return;
+    const mems = await loadMembers(currentRoom.id);
+    if (mems.length < 2) { notify('Need at least 2 players', 'error'); return; }
+    const order = buildSnakeOrder(mems);
+    setDraftOrder(order);
+    setCurrentPick(0);
+    setPicks([]);
+    setDraftStarted(true);
+    await supabase.from(TABLES.rooms).update({ status: 'drafting' }).eq('id', currentRoom.id);
+    startTimer();
+    notify('Draft started! ð¥', 'success');
+  }
+
+  function startTimer() {
+    setTimeLeft(30);
+    clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) { clearInterval(timerRef.current); autoPick(); return 0; }
+        return prev - 1;
+      });
+    }, 1000);
+  }
+
+  async function autoPick() {
+    if (featured.length) {
+      const available = featured.filter(f => !picks.some(p => p.player_id === f.id));
+      if (available.length) { await draftPlayer(available[0]); return; }
     }
+    notify('No player available for auto-pick', 'error');
   }
 
   async function draftPlayer(player) {
-    try {
-      if (!activeRoom) {
-        showToast('Choose a room first.')
-        return
-      }
-      if (activeRoom.status !== 'live') {
-        showToast('Start the draft first.')
-        return
-      }
-      if (activeRoom.current_turn_user_id !== user.id) {
-        showToast('It is not your turn yet.')
-        return
-      }
-      const alreadyDrafted = activePicks.some((pick) => pick.player_id === player.player_id)
-      if (alreadyDrafted) {
-        showToast('That player has already been drafted.')
-        return
-      }
+    if (!currentRoom || !draftStarted) return;
+    const alreadyPicked = picks.some(p => p.player_id === player.id);
+    if (alreadyPicked) { notify('Already drafted!', 'error'); return; }
 
-      const nextPickNumber = Number(activeRoom.current_pick_number || 1)
-      const { error: pickError } = await supabase.from(TABLES.picks).insert({
-        room_id: activeRoom.id,
-        player_id: player.player_id,
-        picked_by_user_id: user.id,
-        pick_number: nextPickNumber,
-        round_number: Math.ceil(nextPickNumber / Math.max(activeMembers.length, 1)),
-        team_name: activeMembers.find((member) => member.member_user_id === user.id)?.team_name || `${normalizeUserName(profile, user)} Team`
-      })
-      if (pickError) throw pickError
+    const memberId = draftOrder[currentPick];
+    const member = members.find(m => m.id === memberId);
+    const pts = fantasyPts();
 
-      const order = Array.isArray(activeRoom.draft_order) ? activeRoom.draft_order : []
-      const nextIndex = nextPickNumber % Math.max(order.length, 1)
-      const nextTurnUserId = order[nextIndex] || null
-      const totalSlots = activeMembers.length * 5
-      const shouldComplete = nextPickNumber >= totalSlots
+    const pickRow = {
+      user_id: user.id, room_id: currentRoom.id, member_id: memberId,
+      player_id: player.id, player_name: player.name, player_team: player.team,
+      player_pos: player.pos, player_thumb: player.thumb,
+      pick_number: currentPick, fantasy_pts: pts
+    };
 
-      const roomUpdate = {
-        current_pick_number: nextPickNumber + 1,
-        current_turn_user_id: shouldComplete ? null : nextTurnUserId,
-        status: shouldComplete ? 'complete' : 'live'
-      }
+    const { error } = await supabase.from(TABLES.picks).insert(pickRow);
+    if (error) { notify(error.message, 'error'); return; }
 
-      const { error: roomError } = await supabase.from(TABLES.rooms).update(roomUpdate).eq('id', activeRoom.id)
-      if (roomError) throw roomError
+    const newPicks = [...picks, pickRow];
+    setPicks(newPicks);
 
-      if (shouldComplete) {
-        const latestPicks = [...activePicks, {
-          room_id: activeRoom.id,
-          player_id: player.player_id,
-          picked_by_user_id: user.id,
-          pick_number: nextPickNumber
-        }]
-        const scoredMembers = activeMembers.map((member) => {
-          const memberPicks = latestPicks.filter((pick) => pick.picked_by_user_id === member.member_user_id)
-          return {
-            member,
-            score: scoreRoster(memberPicks, players)
-          }
-        }).sort((a, b) => b.score - a.score)
+    notify(`${member?.display_name || 'Player'} drafted ${player.name}! (${pts} pts)`, 'success');
 
-        if (scoredMembers.length >= 2) {
-          const { error: matchupError } = await supabase.from(TABLES.matchups).insert({
-            room_id: activeRoom.id,
-            home_user_id: scoredMembers[0].member.member_user_id,
-            away_user_id: scoredMembers[1].member.member_user_id,
-            home_score: scoredMembers[0].score,
-            away_score: scoredMembers[1].score,
-            winner_user_id: scoredMembers[0].score >= scoredMembers[1].score ? scoredMembers[0].member.member_user_id : scoredMembers[1].member.member_user_id,
-            week_label: 'Auto Matchup'
-          })
-          if (matchupError) throw matchupError
-        }
-      }
-
-      showToast(`${player.full_name} drafted.`)
-      await loadAppData(user)
-    } catch (error) {
-      console.error('Draft player error:', error.message)
-      showToast('Could not draft that player.')
+    const next = currentPick + 1;
+    if (next >= draftOrder.length) {
+      clearInterval(timerRef.current);
+      setDraftStarted(false);
+      await supabase.from(TABLES.rooms).update({ status: 'complete' }).eq('id', currentRoom.id);
+      notify('Draft complete! ð', 'success');
+      generateMatchups(newPicks);
+    } else {
+      setCurrentPick(next);
+      startTimer();
     }
   }
 
-  async function createBotMatch(event) {
-    event.preventDefault()
-    try {
-      if (!user) return
-      const difficulty = botGameForm.difficulty
-      const humanTeamName = botGameForm.humanTeamName.trim() || `${normalizeUserName(profile, user)} Solo Squad`
-      const botTeamName = botGameForm.botTeamName.trim() || botNames[Math.floor(Math.random() * botNames.length)]
-      const soloRoomName = `${humanTeamName} vs ${botTeamName}`
-      const inviteCode = makeInviteCode()
+  /* ===================== MATCHUPS ===================== */
+  async function generateMatchups(allPicks) {
+    if (!currentRoom || members.length < 2) return;
+    const matchups = [];
+    for (let i = 0; i < members.length; i++) {
+      for (let j = i + 1; j < members.length; j++) {
+        const m1 = members[i], m2 = members[j];
+        const pts1 = allPicks.filter(p => p.member_id === m1.id).reduce((s, p) => s + (p.fantasy_pts || 0), 0);
+        const pts2 = allPicks.filter(p => p.member_id === m2.id).reduce((s, p) => s + (p.fantasy_pts || 0), 0);
+        matchups.push({
+          user_id: user.id, room_id: currentRoom.id,
+          member1_id: m1.id, member2_id: m2.id,
+          member1_name: m1.display_name, member2_name: m2.display_name,
+          member1_pts: pts1, member2_pts: pts2,
+          winner_id: pts1 > pts2 ? m1.id : pts2 > pts1 ? m2.id : null
+        });
+      }
+    }
+    await supabase.from(TABLES.matchups).insert(matchups);
+  }
 
-      const { data: room, error: roomError } = await supabase.from(TABLES.rooms).insert({
-        name: soloRoomName,
-        sport: 'NBA',
-        host_user_id: user.id,
-        invite_code: inviteCode,
-        status: 'solo',
-        draft_order: [user.id],
-        current_pick_number: 1,
-        current_turn_user_id: user.id,
-        max_members: 1
-      }).select('*').single()
-      if (roomError) throw roomError
+  /* ===================== LEADERBOARD ===================== */
+  async function loadLeaderboard() {
+    const { data } = await supabase.from(TABLES.picks).select('member_id, player_name, fantasy_pts, room_id').order('fantasy_pts', { ascending: false }).limit(50);
+    setLeaderboard(data || []);
+    setView('leaderboard');
+  }
 
-      const { error: memberError } = await supabase.from(TABLES.members).insert({
-        room_id: room.id,
-        member_user_id: user.id,
-        role: 'host',
-        joined_at: new Date().toISOString(),
-        team_name: humanTeamName,
-        draft_position: 1
-      })
-      if (memberError) throw memberError
-
-      const pool = [...players].sort((a, b) => Number(b.fantasy_points || 0) - Number(a.fantasy_points || 0)).slice(0, 8)
-      const humanRoster = pool.filter((_, index) => index % 2 === 0)
-      const botRoster = pool.filter((_, index) => index % 2 === 1)
-      const humanScore = scoreRoster(humanRoster.map((player) => ({ player_id: player.player_id })), players)
-      const botBase = scoreRoster(botRoster.map((player) => ({ player_id: player.player_id })), players)
-      const botScore = Math.max(0, botBase + getDifficultyBoost(difficulty))
-      const winner = humanScore >= botScore ? 'human' : 'bot'
-      const summary = createBotSummary(humanScore, botScore, difficulty)
-
-      const { error: botError } = await supabase.from(TABLES.botMatches).insert({
-        room_id: room.id,
-        owner_user_id: user.id,
-        difficulty,
-        status: 'complete',
-        bot_team_name: botTeamName,
-        human_team_name: humanTeamName,
-        human_score: humanScore,
-        bot_score: botScore,
-        winner,
-        summary,
-        completed_at: new Date().toISOString()
-      })
-      if (botError) throw botError
-
-      setBotGameForm(initialBotGame)
-      setActiveRoomId(room.id)
-      showToast(`Solo showdown complete: ${winner === 'human' ? 'you won' : `${botTeamName} won`}.`)
-      await loadAppData(user)
-    } catch (error) {
-      console.error('Create bot match error:', error.message)
-      showToast('Could not start a computer matchup.')
+  /* ===================== BOT ARENA ===================== */
+  async function startBotArena() {
+    setBotDrafting(true); setBotResults(null); setView('bot');
+    const pool = featured.length ? [...featured] : [];
+    if (!pool.length) { notify('Loading players...', 'error'); setBotDrafting(false); return; }
+    const userTeam = [], botTeam = [];
+    const shuffled = pool.sort(() => Math.random() - 0.5);
+    for (let i = 0; i < Math.min(6, shuffled.length); i++) {
+      await wait(600);
+      if (i % 2 === 0) userTeam.push({ ...shuffled[i], pts: fantasyPts() });
+      else botTeam.push({ ...shuffled[i], pts: fantasyPts() });
+    }
+    const uTotal = userTeam.reduce((s, p) => s + p.pts, 0);
+    const bTotal = botTeam.reduce((s, p) => s + p.pts, 0);
+    setBotResults({ userTeam, botTeam, uTotal, bTotal, win: uTotal > bTotal });
+    setBotDrafting(false);
+    if (user) {
+      await supabase.from(TABLES.botMatches).insert({
+        user_id: user.id, user_pts: uTotal, bot_pts: bTotal, won: uTotal > bTotal
+      });
     }
   }
 
-  if (loading) {
-    return <div className="loading-screen">Loading dream team...</div>
+  /* ===================== SEARCH ===================== */
+  const debounceRef = useRef(null);
+  function handleSearch(val) {
+    setSearchTerm(val);
+    clearTimeout(debounceRef.current);
+    if (val.length < 2) { setSearchResults([]); return; }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      const r = await searchPlayers(val);
+      setSearchResults(r);
+      setSearching(false);
+    }, 350);
   }
 
-  if (!session || !user) {
+  /* ===================== HELPERS ===================== */
+  function notify(msg, type = 'info') { setToast({ msg, type, key: Date.now() }); }
+  function myPicks() { return picks.filter(p => p.member_id === members.find(m => m.user_id === user?.id)?.id); }
+  function isMyTurn() {
+    if (!draftStarted || !draftOrder.length) return false;
+    const mem = members.find(m => m.user_id === user?.id);
+    return mem && draftOrder[currentPick] === mem.id;
+  }
+
+  /* ===================== RENDER ===================== */
+  if (!user) {
     return (
-      <div className="auth-shell">
-        <div className="app-bg-orb orb-one"></div>
-        <div className="app-bg-orb orb-two"></div>
-        <div className="auth-card">
-          <div className="auth-copy-wrap">
-            <p className="eyebrow">NBA fantasy draft room</p>
-            <h1>Dream Team</h1>
-            <p>Create draft rooms, invite friends, draft NBA stars, and now run solo battles against the computer.</p>
-          </div>
-
+      <div className="app auth-screen">
+        <ThreeCourtHero />
+        <div className="auth-card glass-panel">
+          <h1 className="brand">ð Dream Team</h1>
+          <p className="brand-sub">Fantasy Draft</p>
           <div className="auth-tabs">
-            <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">Log in</button>
-            <button className={authMode === 'signup' ? 'active' : ''} onClick={() => setAuthMode('signup')} type="button">Sign up</button>
+            <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')}>Login</button>
+            <button className={authMode === 'signup' ? 'active' : ''} onClick={() => setAuthMode('signup')}>Sign Up</button>
           </div>
-
-          <form className="auth-form" onSubmit={handleAuthSubmit}>
-            <label>
-              <span>Email</span>
-              <input type="email" value={authForm.email} onChange={(event) => setAuthForm((prev) => ({ ...prev, email: event.target.value }))} placeholder="you@example.com" required />
-            </label>
-            <label>
-              <span>Password</span>
-              <input type="password" value={authForm.password} onChange={(event) => setAuthForm((prev) => ({ ...prev, password: event.target.value }))} placeholder="Enter password" minLength={6} required />
-            </label>
-            <button className="primary-button" type="submit" disabled={saving}>{saving ? 'Working...' : authMode === 'login' ? 'Log in' : 'Create account'}</button>
-          </form>
+          {authErr && <p className="auth-error">{authErr}</p>}
+          <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
+          <input placeholder="Password" type="password" value={pw} onChange={e => setPw(e.target.value)} />
+          <button className="btn-accent" onClick={handleAuth} disabled={authLoading}>
+            {authLoading ? 'Loading...' : authMode === 'login' ? 'Sign In' : 'Create Account'}
+          </button>
         </div>
-        {toast ? <div className="toast">{toast}</div> : null}
+        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
       </div>
-    )
+    );
   }
 
-  return (
-    <div className="app-shell">
-      <div className="app-bg-orb orb-one"></div>
-      <div className="app-bg-orb orb-two"></div>
+  /* ---- Dashboard ---- */
+  if (view === 'dash') {
+    return (
+      <div className="app">
+        <header className="top-bar glass-panel">
+          <span className="logo">ð Dream Team</span>
+          <nav>
+            <button onClick={() => setView('profile')}>ð§</button>
+            <button onClick={loadLeaderboard}>ð</button>
+            <button onClick={logout}>â</button>
+          </nav>
+        </header>
 
-      <header className="topbar glass-panel">
-        <div>
-          <p className="eyebrow">NBA fantasy control room</p>
-          <h2>{profile?.username?.trim() || normalizeUserName(profile, user)}</h2>
-          <div className="hero-chips">
-            <span>{leagueMeta?.strLeague || 'NBA'} live draft</span>
-            <span>{rooms.length} rooms</span>
-            <span>{botMatches.length} bot battles</span>
+        <div className="dash">
+          <h2>Welcome, {profile?.display_name || 'Player'}!</h2>
+
+          <div className="dash-grid">
+            <div className="dash-card glass-panel" onClick={createRoom}>
+              <span className="dash-icon">ð</span>
+              <h3>Create Room</h3>
+              <p>Start a new draft room</p>
+            </div>
+            <div className="dash-card glass-panel" onClick={() => {
+              const code = prompt('Enter room code:');
+              if (code) joinByCode(code);
+            }}>
+              <span className="dash-icon">ð</span>
+              <h3>Join Room</h3>
+              <p>Enter with a code</p>
+            </div>
+            <div className="dash-card glass-panel" onClick={startBotArena}>
+              <span className="dash-icon">ð¤</span>
+              <h3>Bot Arena</h3>
+              <p>Draft vs AI opponent</p>
+            </div>
+            <div className="dash-card glass-panel" onClick={loadLeaderboard}>
+              <span className="dash-icon">ð</span>
+              <h3>Leaderboard</h3>
+              <p>Top fantasy scores</p>
+            </div>
+          </div>
+
+          <h3 className="section-title">Open Rooms</h3>
+          <div className="room-list">
+            {rooms.length === 0 && <p className="empty">No rooms yet â create one!</p>}
+            {rooms.map(r => (
+              <div key={r.id} className="room-card glass-panel" onClick={() => joinRoom(r)}>
+                <div className="room-info">
+                  <strong>{r.name}</strong>
+                  <span className="room-code">Code: {r.code}</span>
+                </div>
+                <span className={`room-status s-${r.status}`}>{r.status} Â· {r.max_players} max</span>
+              </div>
+            ))}
           </div>
         </div>
-        <div className="topbar-actions">
-          <button className="ghost-button" type="button" onClick={handleLogout}>Log out</button>
+        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+      </div>
+    );
+  }
+
+  /* ---- Profile ---- */
+  if (view === 'profile') {
+    return (
+      <div className="app">
+        <header className="top-bar glass-panel">
+          <button onClick={() => setView('dash')}>â Back</button>
+          <span className="logo">Profile</span>
+        </header>
+        <div className="profile-page">
+          <div className="avatar-big">{avatar}</div>
+          <div className="avatar-picker">
+            {avatarChoices.map(a => (
+              <button key={a} className={a === avatar ? 'active' : ''} onClick={() => setAvatar(a)}>{a}</button>
+            ))}
+          </div>
+          <input placeholder="Display Name" value={displayName} onChange={e => setDisplayName(e.target.value)} />
+          <button className="btn-accent" onClick={saveProfile}>Save Profile</button>
         </div>
+        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+      </div>
+    );
+  }
+
+  /* ---- Leaderboard ---- */
+  if (view === 'leaderboard') {
+    return (
+      <div className="app">
+        <header className="top-bar glass-panel">
+          <button onClick={() => setView('dash')}>â Back</button>
+          <span className="logo">ð Leaderboard</span>
+        </header>
+        <div className="leaderboard">
+          {leaderboard.length === 0 && <p className="empty">No picks yet</p>}
+          {leaderboard.map((entry, i) => (
+            <div key={i} className="lb-row glass-panel">
+              <span className="lb-rank">#{i + 1}</span>
+              <span className="lb-name">{entry.player_name}</span>
+              <span className="lb-pts">{entry.fantasy_pts} pts</span>
+            </div>
+          ))}
+        </div>
+        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+      </div>
+    );
+  }
+
+  /* ---- Bot Arena ---- */
+  if (view === 'bot') {
+    return (
+      <div className="app">
+        <header className="top-bar glass-panel">
+          <button onClick={() => setView('dash')}>â Back</button>
+          <span className="logo">ð¤ Bot Arena</span>
+        </header>
+        <div className="bot-arena">
+          {botDrafting && <div className="bot-loading"><div className="spinner"></div><p>Drafting against AI...</p></div>}
+          {botResults && (
+            <div className="bot-results">
+              <h2 className={botResults.win ? 'win' : 'lose'}>{botResults.win ? 'ð You Win!' : 'ð¤ Bot Wins!'}</h2>
+              <div className="bot-matchup">
+                <div className="bot-team">
+                  <h3>Your Team ({botResults.uTotal} pts)</h3>
+                  {botResults.userTeam.map((p, i) => (
+                    <div key={i} className="bot-player">
+                      {p.thumb && <img src={p.thumb} alt={p.name} />}
+                      <span>{p.name}</span>
+                      <span className="pts">{p.pts}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="bot-vs">VS</div>
+                <div className="bot-team">
+                  <h3>Bot ({botResults.bTotal} pts)</h3>
+                  {botResults.botTeam.map((p, i) => (
+                    <div key={i} className="bot-player">
+                      {p.thumb && <img src={p.thumb} alt={p.name} />}
+                      <span>{p.name}</span>
+                      <span className="pts">{p.pts}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <button className="btn-accent" onClick={startBotArena}>Rematch</button>
+            </div>
+          )}
+        </div>
+        {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+      </div>
+    );
+  }
+
+  /* ---- Draft Room ---- */
+  return (
+    <div className="app">
+      <header className="top-bar glass-panel">
+        <button onClick={() => { setView('dash'); setCurrentRoom(null); }}>â Back</button>
+        <span className="logo">{currentRoom?.name || 'Draft Room'}</span>
+        <span className="room-code-badge">{currentRoom?.code}</span>
       </header>
 
-      <main className="dashboard-grid">
-        <section className="hero-panel glass-panel">
-          <div>
-            <p className="eyebrow">Commissioner dashboard</p>
-            <h3>Draft with friends or run a solo showdown against the computer.</h3>
-            <p>Spin up NBA draft rooms, invite your league, search real players, and use the new bot arena when you want a quick fantasy matchup without waiting on anyone else.</p>
-            <div className="hero-chips">
-              <span>Auth enabled</span>
-              <span>Invite codes</span>
-              <span>Bot mode ready</span>
-            </div>
+      {/* Draft HUD */}
+      <div className="draft-hud glass-panel">
+        <div className="hud-item">
+          <span className="hud-label">Round</span>
+          <span className="hud-val">{Math.floor(currentPick / Math.max(members.length, 1)) + 1}</span>
+        </div>
+        <div className="hud-item">
+          <span className="hud-label">Pick</span>
+          <span className="hud-val">{currentPick + 1}/{draftOrder.length || '?'}</span>
+        </div>
+        <div className="hud-item">
+          <span className="hud-label">Timer</span>
+          <span className={`hud-val timer ${timeLeft <= 10 ? 'urgent' : ''}`}>{timeLeft}s</span>
+        </div>
+      </div>
+
+      {/* Members bar */}
+      <div className="members-bar">
+        {members.map(m => (
+          <div key={m.id} className={`member-chip ${draftStarted && draftOrder[currentPick] === m.id ? 'active' : ''}`}>
+            <span className="member-avatar">{m.avatar || 'ð'}</span>
+            <span className="member-name">{m.display_name}</span>
           </div>
-          <ThreeCourtHero />
-        </section>
+        ))}
+      </div>
 
-        <aside className="panel-column">
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Profile</p>
-                <h3>Settings</h3>
-              </div>
-            </div>
-            <form className="settings-form" onSubmit={saveSettings}>
-              <label>
-                <span>Username</span>
-                <input value={settingsName} onChange={(event) => setSettingsName(event.target.value)} placeholder="Pick a GM name" maxLength={24} />
-              </label>
-              <label>
-                <span>Favorite team</span>
-                <input value={settingsTeam} onChange={(event) => setSettingsTeam(event.target.value)} placeholder="Lakers, Knicks, Celtics..." maxLength={32} />
-              </label>
-              <button className="primary-button" type="submit">Save profile</button>
-            </form>
-          </section>
+      {!draftStarted && (
+        <div className="draft-actions">
+          <button className="btn-accent big" onClick={startDraft}>ð Start Draft</button>
+          <p className="hint">{members.length} player{members.length !== 1 ? 's' : ''} in room</p>
+        </div>
+      )}
 
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Create room</p>
-                <h3>New draft room</h3>
-              </div>
-            </div>
-            <form className="room-form" onSubmit={createRoom}>
-              <label>
-                <span>Room name</span>
-                <input value={roomForm.name} onChange={(event) => setRoomForm((prev) => ({ ...prev, name: event.target.value }))} placeholder="Friday Night Draft" required />
-              </label>
-              <label>
-                <span>Your team name</span>
-                <input value={roomForm.teamName} onChange={(event) => setRoomForm((prev) => ({ ...prev, teamName: event.target.value }))} placeholder="Skyhook Syndicate" />
-              </label>
-              <button className="primary-button" type="submit">Create room</button>
-            </form>
-          </section>
+      {/* Search */}
+      {draftStarted && isMyTurn() && (
+        <div className="search-section">
+          <input placeholder="Search NBA players..." value={searchTerm} onChange={e => handleSearch(e.target.value)} className="search-input" />
+          {searching && <div className="spinner small"></div>}
+        </div>
+      )}
 
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Join room</p>
-                <h3>Use invite code</h3>
+      {/* Player grid */}
+      <div className="player-grid">
+        {(searchResults.length ? searchResults : featured).map(p => {
+          const drafted = picks.some(pk => pk.player_id === p.id);
+          return (
+            <div key={p.id} className={`player-card glass-panel ${drafted ? 'drafted' : ''}`}>
+              <div className="player-visual">
+                {p.thumb ? <img src={p.thumb} alt={p.name} /> : <div className="player-fallback">ð</div>}
               </div>
+              <div className="player-info">
+                <h4>{p.name}</h4>
+                <p className="player-team">{p.team} Â· {p.pos}</p>
+              </div>
+              {draftStarted && isMyTurn() && !drafted && (
+                <button className="draft-btn" onClick={() => draftPlayer(p)}>Draft</button>
+              )}
+              {drafted && <span className="drafted-badge">Drafted</span>}
             </div>
-            <form className="join-form" onSubmit={joinRoom}>
-              <input value={joinCode} onChange={(event) => setJoinCode(event.target.value)} placeholder="Enter invite code" maxLength={8} />
-              <button className="ghost-button" type="submit">Join draft</button>
-            </form>
-          </section>
-        </aside>
+          );
+        })}
+      </div>
 
-        <section className="main-column">
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Draft board</p>
-                <h3>{activeRoom?.name || 'Choose a room'}</h3>
+      {/* My Picks */}
+      {picks.length > 0 && (
+        <div className="my-picks">
+          <h3>ð My Picks</h3>
+          <div className="pick-list">
+            {myPicks().map((p, i) => (
+              <div key={i} className="pick-chip">
+                {p.player_thumb && <img src={p.player_thumb} alt="" />}
+                <span>{p.player_name}</span>
+                <span className="pick-pts">{p.fantasy_pts} pts</span>
               </div>
-              <div className="inline-actions">
-                {activeRoom ? <span className="mini-label">Status: {activeRoom.status}</span> : null}
-                {activeRoom?.invite_code ? <span className="mini-label">Invite: {activeRoom.invite_code}</span> : null}
-                {activeRoom?.status === 'waiting' ? <button className="primary-button" type="button" onClick={startDraft}>Start draft</button> : null}
-              </div>
-            </div>
+            ))}
+          </div>
+        </div>
+      )}
 
-            {rooms.length ? (
-              <div className="room-list">
-                {rooms.map((room) => (
-                  <button key={room.id} type="button" className="room-tile" onClick={() => setActiveRoomId(room.id)}>
-                    <strong>{room.name}</strong>
-                    <p>{room.status} · {room.invite_code}</p>
-                  </button>
-                ))}
-              </div>
-            ) : <div className="empty-state">No rooms yet. Create one on the left.</div>}
-
-            <div className="draft-room-grid" style={{ marginTop: 16 }}>
-              <div className="draft-state-card">
-                <span className="mini-label">Turn</span>
-                <p className="muted-copy">{activeRoom?.current_turn_user_id === user.id ? 'Your pick' : activeRoom?.current_turn_user_id ? 'Another manager is up' : 'Waiting to start'}</p>
-              </div>
-              <div className="draft-state-card">
-                <span className="mini-label">Pick #</span>
-                <p className="muted-copy">{activeRoom?.current_pick_number || 1}</p>
-              </div>
-              <div className="draft-state-card">
-                <span className="mini-label">Managers</span>
-                <p className="muted-copy">{activeMembers.length}</p>
-              </div>
-            </div>
-          </section>
-
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Player pool</p>
-                <h3>Search and draft NBA players</h3>
-              </div>
-            </div>
-            <div className="search-bar">
-              <input value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder="Search NBA players" />
-            </div>
-            <div className="player-grid">
-              {(searchResults.length ? searchResults.map((player) => ({
-                player_id: player.idPlayer,
-                full_name: player.strPlayer,
-                team: player.strTeam || 'NBA',
-                position: player.strPosition || 'Flex',
-                headshot_url: player.strCutout || player.strThumb || '',
-                fantasy_points: 40
-              })) : featuredPlayers).map((player) => {
-                const drafted = activePicks.some((pick) => pick.player_id === player.player_id)
-                return (
-                  <article key={player.player_id} className={`player-card ${drafted ? 'drafted' : ''}`}>
-                    <div className="player-visual">
-                      {player.headshot_url ? <img src={player.headshot_url} alt={player.full_name} /> : <div className="player-fallback">🏀</div>}
-                    </div>
-                    <div>
-                      <strong>{player.full_name}</strong>
-                      <p>{player.team} · {player.position}</p>
-                      <p>Projected fantasy score: {Number(player.fantasy_points || 0).toFixed(1)}</p>
-                    </div>
-                    <button className="ghost-button" type="button" disabled={drafted} onClick={() => draftPlayer(player)}>
-                      {drafted ? 'Drafted' : 'Draft player'}
-                    </button>
-                  </article>
-                )
-              })}
-            </div>
-          </section>
-        </section>
-
-        <aside className="side-column">
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Leaderboard</p>
-                <h3>Room standings</h3>
-              </div>
-            </div>
-            <div className="leaderboard-list">
-              {leaderboard.length ? leaderboard.map((member, index) => (
-                <article key={`${member.room_id}-${member.member_user_id}`} className="leaderboard-item">
-                  <div className="rank-badge">{index + 1}</div>
-                  <div>
-                    <strong>{member.team_name}</strong>
-                    <p>{member.role}</p>
-                  </div>
-                  <strong>{member.score.toFixed(1)}</strong>
-                </article>
-              )) : <div className="empty-state">Draft a room to see standings.</div>}
-            </div>
-          </section>
-
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Play vs computer</p>
-                <h3>Solo bot arena</h3>
-              </div>
-            </div>
-            <form className="bot-form" onSubmit={createBotMatch}>
-              <label>
-                <span>Difficulty</span>
-                <select value={botGameForm.difficulty} onChange={(event) => setBotGameForm((prev) => ({ ...prev, difficulty: event.target.value }))}>
-                  <option value="easy">Easy</option>
-                  <option value="medium">Medium</option>
-                  <option value="hard">Hard</option>
-                </select>
-              </label>
-              <label>
-                <span>Your solo team name</span>
-                <input value={botGameForm.humanTeamName} onChange={(event) => setBotGameForm((prev) => ({ ...prev, humanTeamName: event.target.value }))} placeholder="Midrange Machines" />
-              </label>
-              <label>
-                <span>Bot team name</span>
-                <input value={botGameForm.botTeamName} onChange={(event) => setBotGameForm((prev) => ({ ...prev, botTeamName: event.target.value }))} placeholder="Leave blank for random" />
-              </label>
-              <button className="primary-button" type="submit">Run bot matchup</button>
-            </form>
-          </section>
-
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Solo results</p>
-                <h3>Bot battle history</h3>
-              </div>
-            </div>
-            <div className="bot-match-list">
-              {botLeaderboard.length ? botLeaderboard.map((match) => (
-                <article key={match.id} className="bot-match-card">
-                  <div className="inline-actions">
-                    <span className="bot-badge">{match.difficulty}</span>
-                    <span className="bot-badge">{match.winner === 'human' ? 'You won' : 'Bot won'}</span>
-                  </div>
-                  <p><strong>{match.human_team_name}</strong> vs <strong>{match.bot_team_name}</strong></p>
-                  <div className="bot-score-grid">
-                    <div className="stat-box">
-                      <span>Your score</span>
-                      <strong>{Number(match.human_score || 0).toFixed(1)}</strong>
-                    </div>
-                    <div className="stat-box">
-                      <span>Bot score</span>
-                      <strong>{Number(match.bot_score || 0).toFixed(1)}</strong>
-                    </div>
-                  </div>
-                  <p>{match.summary}</p>
-                </article>
-              )) : <div className="empty-state">No computer matchups yet. Start one above.</div>}
-            </div>
-          </section>
-
-          <section className="card-section glass-panel">
-            <div className="section-head">
-              <div>
-                <p className="eyebrow">Auto matchups</p>
-                <h3>Generated results</h3>
-              </div>
-            </div>
-            <div className="matchup-list">
-              {activeMatchups.length ? activeMatchups.map((matchup) => (
-                <article key={matchup.id} className="matchup-card">
-                  <strong>{matchup.week_label || 'Matchup'}</strong>
-                  <p>{Number(matchup.home_score || 0).toFixed(1)} - {Number(matchup.away_score || 0).toFixed(1)}</p>
-                </article>
-              )) : <div className="empty-state">Finish a draft to auto-generate a matchup.</div>}
-            </div>
-          </section>
-        </aside>
-      </main>
-
-      {toast ? <div className="toast">{toast}</div> : null}
+      {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
     </div>
-  )
+  );
 }
